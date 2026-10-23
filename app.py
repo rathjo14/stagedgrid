@@ -88,7 +88,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from schema import ColumnSpec, Lookups, ModelE, describe, dsn, make_engine
+from schema import (
+    ColumnSpec,
+    Lookups,
+    ModelE,
+    Updates,
+    describe,
+    dsn,
+    make_engine,
+)
 from data import (
     Branch,
     ColumnFilter,
@@ -1306,7 +1314,7 @@ def demo_schema_hint(repository, exc: Exception) -> str:
     )
 
 
-def load_model(ref: str) -> type:
+def load_model(ref: str, flag: str = "--model") -> type:
     """Import a mapped class named as ``package.module:ClassName``.
 
     Your models do not have to live here -- anything importable works, so put
@@ -1315,16 +1323,16 @@ def load_model(ref: str) -> type:
     module_name, _, attr = ref.partition(":")
     if not module_name or not attr:
         raise SystemExit(
-            f"--model wants 'package.module:ClassName', got {ref!r}"
+            f"{flag} wants 'package.module:ClassName', got {ref!r}"
         )
     try:
         module = importlib.import_module(module_name)
     except ImportError as exc:
-        raise SystemExit(f"--model {ref}: {exc}") from None
+        raise SystemExit(f"{flag} {ref}: {exc}") from None
     try:
         return getattr(module, attr)
     except AttributeError:
-        raise SystemExit(f"--model {ref}: {module_name} has no {attr!r}") from None
+        raise SystemExit(f"{flag} {ref}: {module_name} has no {attr!r}") from None
 
 
 def parse_labels(text: str) -> dict[str, str]:
@@ -1344,9 +1352,10 @@ def parse_labels(text: str) -> dict[str, str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Staged editor for a fact table.",
-        epilog="Point it at your own schema with --model and --dsn, or set "
-               "STAGEDGRID_MODEL / STAGEDGRID_DSN. With neither, it opens the "
-               "bundled demo schema.",
+        epilog="Point it at your own schema with --model, --updates-model and "
+               "--dsn, or set STAGEDGRID_MODEL / STAGEDGRID_UPDATES_MODEL / "
+               "STAGEDGRID_DSN. With none of them, it opens the bundled demo "
+               "schema.",
     )
     parser.add_argument(
         "--dsn",
@@ -1358,6 +1367,16 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("STAGEDGRID_MODEL"),
         help="the mapped class to edit, as package.module:ClassName "
              "(or $STAGEDGRID_MODEL). Defaults to the demo schema.",
+    )
+    parser.add_argument(
+        "--updates-model",
+        default=os.environ.get("STAGEDGRID_UPDATES_MODEL"),
+        help="the mapped class commits are written to, as "
+             "package.module:ClassName (or $STAGEDGRID_UPDATES_MODEL). Its "
+             "columns are found by type -- json for the changes, a foreign "
+             "key for the version, a timestamp, a name -- so it does not have "
+             "to look like the demo one. Pass 'none' to turn committing to a "
+             "table off and write only to --changesets.",
     )
     parser.add_argument(
         "--labels",
@@ -1392,8 +1411,17 @@ def main(argv: list[str] | None = None) -> int:
 
     model = load_model(args.model) if args.model else ModelE
     labels = parse_labels(args.labels) if args.labels else None
+    if args.updates_model and args.updates_model.strip().lower() in ("none", "off"):
+        updates = None
+    elif args.updates_model:
+        updates = load_model(args.updates_model, "--updates-model")
+    else:
+        updates = Updates
     repository = Repository(
-        engine=make_engine(args.dsn), model=model, label_columns=labels
+        engine=make_engine(args.dsn),
+        model=model,
+        label_columns=labels,
+        updates_model=updates,
     )
 
     # Say which schema and database before touching either, so a failure
@@ -1403,6 +1431,17 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"stagedgrid: {args.model or 'the bundled demo schema'} "
         f"({model.__tablename__}) at {args.dsn or dsn()}",
+        file=sys.stderr,
+    )
+    print(
+        "stagedgrid: commits go to "
+        + (
+            f"{repository.updates.model.__name__} "
+            f"({repository.updates.model.__tablename__}."
+            f"{repository.updates.changes})"
+            if repository.updates is not None
+            else "--changesets only, no table"
+        ),
         file=sys.stderr,
     )
     if not args.model:

@@ -15,7 +15,7 @@ source .venv/Scripts/activate     # or .venv\Scripts\activate.bat on cmd
 python app.py                     # the grid
 python schema.py --reset --rows 400   # (re)seed the demo data
 python schema.py --reset --rows 10000 --one-version   # a realistic single version
-python -m pytest                  # 164 tests, no server needed (sqlite)
+python -m pytest                  # 166 tests, no server needed (sqlite)
 ```
 
 There is no package and nothing to install: five modules in one folder that
@@ -70,7 +70,7 @@ without touching the code:
 
 ```bash
 # your repo has to be importable: pip install -e it, or put it on PYTHONPATH
-python app.py --describe     --model yourrepo.models:FactTable     --dsn "postgresql+psycopg2://user:pw@host:5432/yourdb"
+python app.py --describe     --model yourrepo.models:FactTable     --updates-model yourrepo.models:RevisionSet     --dsn "postgresql+psycopg2://user:pw@host:5432/yourdb"
 ```
 
 Flags are the reliable form: they are visible in the command and cannot be
@@ -79,6 +79,7 @@ come from the environment instead, which is handy once it works:
 
 ```bash
 export STAGEDGRID_MODEL="yourrepo.models:FactTable"
+export STAGEDGRID_UPDATES_MODEL="yourrepo.models:RevisionSet"
 export STAGEDGRID_DSN="postgresql+psycopg2://user:pw@host:5432/yourdb"
 python app.py
 ```
@@ -87,12 +88,31 @@ Note that an environment default never appears in `sys.argv` -- printing argv
 to check will show no `--model` even when it arrived. `--describe` prints the
 variables as the process actually sees them, which is the thing to trust.
 
-Flags work too, and win over the environment: `--dsn`, `--model`, `--labels`.
+Flags work too, and win over the environment: `--dsn`, `--model`,
+`--updates-model`, `--labels`.
 With none of them set you get the bundled demo schema, which is what makes it
 possible to keep developing here.
 
-Every run prints which schema and database it is about to use, so check that
-line first if something looks wrong:
+### The branch table
+
+`--updates-model` is the same idea for the table commits are written to. Its
+columns are found by **type**, not by name, so yours does not have to look
+like the demo one:
+
+| it needs | found as |
+| --- | --- |
+| the changes | the first json/jsonb column |
+| the version | the first foreign key (to the version dimension, when there is one) |
+| modified-at | the first timestamp -- stamped on every push |
+| a name | the first string column -- shown in the branch list |
+
+Anything else on the table is left alone, so a `ticket` or `raised_by` column
+is no obstacle. `UpdatesSpec.from_mapped_class` does the matching and raises
+if there is no json column to write to. Pass `--updates-model none` to commit
+to `--changesets` and the sink only, writing to no table at all.
+
+Every run prints which schema and database it is about to use, and where
+commits will go, so check those lines first if something looks wrong:
 
 ```
 stagedgrid: yourrepo.models:FactTable (fact_table) at postgresql+psycopg2://...
@@ -393,6 +413,44 @@ typing a duplicate of a row the grid is not showing is still caught.
   recomputed on every selection change, and a query per mouse drag is not worth
   a sum in the status bar. Copy, delete and revert do fetch what they were
   asked for.
+
+## Where the changes actually live
+
+Nothing accumulates in a log. The state *is* the rows, and everything else is
+derived from them on demand -- which is why there is nothing to keep in sync.
+
+| what | where | holds |
+| --- | --- | --- |
+| one row | `data.Row` | `values` (live), `original` (what the database had, taken on the first edit only), `state`, `uid`, `errors` |
+| new rows | `StagedTableModel._staged: list[Row]` | the staging block, `state=NEW` |
+| touched stored rows | `StagedTableModel._held: dict[uid, Row]` | **the pending set.** Every row this session edited or deleted, kept whatever the window is showing |
+| the rows on screen | `StagedTableModel._db_rows: list[Row]` | the fetched window: clean rows, plus any held ones that fall in it |
+| invented dimension values | `Lookups._pending` | `{placeholder_id: {table, column, label}}` |
+
+A row counts as pending when `row.changed_keys()` is non-empty or its `state`
+is not `CLEAN`; `_note_held` keeps `_held` to exactly those, dropping a row
+the moment it is reverted.
+
+`model.changeset()` walks `_staged + _held` and builds the hand-off structure
+fresh each call:
+
+```
+ChangeSet
+  .table                 str
+  .operations            list[Operation]
+     .kind               "insert" | "update" | "delete"
+     .pk                 the primary key, None for an insert
+     .key / .key_text    the natural key, as ids and as labels
+     .values             an insert's data columns
+     .changes            list[CellChange(column, header, old, new, old_text, new_text)]
+  .new_values            dimension values invented here
+  .inserts/.updates/.deletes      the operations, filtered
+  .to_payload()          the JSON dict below
+```
+
+`Repository.save_branch(payload, version_id, ...)` is what writes that dict
+into the branch table's json column, so `UPDATE <updates>.<changes>` is the
+only place any of this is persisted.
 
 ## Getting at the changes
 

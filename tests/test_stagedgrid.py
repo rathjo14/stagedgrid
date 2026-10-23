@@ -679,6 +679,66 @@ def test_a_cell_at_fault_shows_through_a_duplicate(model, repo):
     assert _fill(model, 0, "label") == grid.C.staged_invalid_cell.name()
     assert _fill(model, 0, "a_id") == grid.C.staged_invalid.name()
 
+
+# ------------------------------------------------- somebody else's branch table
+def test_a_differently_shaped_updates_table_still_works(qapp, repo):
+    """The branch table is found by column type, not by name.
+
+    Different class name, different column names, a different order and an
+    extra column the grid knows nothing about -- it still finds the json to
+    write to, the version to stamp and the name to show.
+    """
+    from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, func
+    from sqlalchemy.dialects.postgresql import JSONB
+    from sqlalchemy.types import JSON
+    from schema import Base, ModelD, UpdatesSpec
+
+    class RevisionSet(Base):
+        __tablename__ = "revision_set"
+        revision_set_id = Column(Integer, primary_key=True)
+        raised_by = Column(String(60))
+        touched_at = Column(DateTime(timezone=True), default=func.now())
+        model_d_id = Column(Integer, ForeignKey("model_d.id"))
+        diff = Column(JSONB().with_variant(JSON, "sqlite"))
+        ticket = Column(Integer)
+
+    Base.metadata.create_all(repo.engine, tables=[RevisionSet.__table__])
+    spec = UpdatesSpec.from_mapped_class(RevisionSet, ModelD.__tablename__)
+    assert spec.pk == "revision_set_id"
+    assert spec.changes == "diff"
+    assert spec.version == "model_d_id"
+    assert spec.modified_at == "touched_at"
+    assert spec.label == "raised_by"
+
+    mine = Repository(engine=repo.engine, updates_model=RevisionSet)
+    assert mine.updates.model is RevisionSet
+
+    # and a branch round-trips through it
+    model = StagedTableModel(mine.spec)
+    model.load(mine.load_rows(), mine.load_lookups())
+    model.validator.set_existing_keys(mine.natural_keys())
+    newest = mine.latest_version()
+    model.set_version(newest[0])
+    for column, text in zip(KEY_COLUMNS, free_key(model, mine)):
+        model.setData(idx(model, 0, column), text)
+    model.setData(idx(model, 0, "label"), "written to someone else's table")
+
+    branch_id = mine.save_branch(
+        model.changeset().to_payload(), version_id=newest[0], label="theirs"
+    )
+    stored = mine.load_branch(branch_id)
+    assert stored.version_id == newest[0]
+    assert stored.label == "theirs"
+    assert stored.changes["operations"][0]["op"] == "insert"
+    assert [b.id for b in mine.list_branches()] == [branch_id]
+
+
+def test_committing_without_an_updates_table_is_allowed(qapp, repo):
+    """--updates-model none: the payload goes to the sink and nowhere else."""
+    mine = Repository(engine=repo.engine, updates_model=None)
+    assert mine.updates is None
+    assert mine.list_branches() == []
+
 # ----------------------------------------------------------------- deletion
 def test_delete_removes_the_row_and_leaves_a_marker(model):
     first_db = model.staged_count
