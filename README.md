@@ -13,7 +13,7 @@ source .venv/Scripts/activate     # or .venv\Scripts\activate.bat on cmd
 python app.py                     # the grid
 python schema.py --reset --rows 400   # (re)seed the demo data
 python schema.py --reset --rows 10000 --one-version   # a realistic single version
-python -m pytest                  # 155 tests, no server needed (sqlite)
+python -m pytest                  # 158 tests, no server needed (sqlite)
 ```
 
 There is no package and nothing to install: five modules in one folder that
@@ -201,12 +201,17 @@ them, so a selected row still shows its state.
   any cell of it and a fresh blank row appears below; paste 20 rows into it
   and 20 staged rows appear. Natural-key cells there are *not* greyed and
   each one is a drop-down of the live values from A/B/C/D and the enum.
-  Each foreign-key drop-down also starts with **+ New A...**, which asks for a
-  value and adds it for this session: it appears in every drop-down for that
-  column straight away and shows in italics, but it is never written to the
+  A key column often needs a value the dimension does not have yet, so there
+  are two ways to say so and they do the same thing: **type the label into the
+  cell**, or pick **+ New A...** at the top of the drop-down. Either way it is
+  added for this session -- it appears in every drop-down for that column
+  straight away and shows in italics -- but it is never written to the
   database. The changeset carries it instead (see below), because creating
   dimension values is your API's job, not this app's. Committing locally is
   refused while a changeset refers to one.
+
+  Enum columns are the exception: their members are a Python class, so an
+  unknown one stays an error.
   Sorting and filtering never touch the staging block -- it stays pinned at
   the top, so a filter can't hide work in progress.
 * **Validation.** Staged rows are checked against the database's natural keys
@@ -400,14 +405,17 @@ callable with the payload on every commit. One operation looks like this:
               "old_text": "0.33", "new_text": "0.98765"}]}
 ```
 
-If any row refers to a value you invented with **+ New ...**, the payload
-gains a `new_dimension_values` list naming the table, the column, the label and
-the negative placeholder id the inserts use. Create those first, then map the
-placeholder ids onto the real ones:
+If any row refers to a value invented here, the payload gains a
+`new_dimension_values` list naming the table, the column, the label and the
+negative placeholder id the inserts use. Create those first, then map the
+placeholder ids onto the real ones. The ids come from one counter for the whole
+session, so they are unique across dimensions -- two columns each inventing a
+value do not both get `-1`:
 
 ```json
 "new_dimension_values": [
-  {"placeholder_id": -1, "table": "model_a", "column": "name", "label": "ANTARCTICA"}
+  {"placeholder_id": -1, "table": "model_a", "column": "name", "label": "ANTARCTICA"},
+  {"placeholder_id": -2, "table": "model_b", "column": "name", "label": "NEW-DESK"}
 ]
 ```
 
@@ -468,9 +476,13 @@ Qt reads `#RRGGBBAA` as `#AARRGGBB`.
   neither fits a proxy's index mapping.
 * Undo commands address rows by a stable `uid`, never by position, so undo
   still works after you re-sort or filter.
-* Unknown drop-down text (from a paste) is kept as `Unresolved("NOT-A-REGION")`
-  rather than dropped, so you see what you typed and get an error on that
-  exact cell.
+* A label a foreign key's dimension does not have is added as a new value for
+  the session rather than rejected -- typing it is as good as using
+  **+ New ...**, because having to find that entry to say what the cell already
+  says is a nuisance. It gets a negative placeholder id, italics, and a line in
+  `new_dimension_values`. `Unresolved` survives for the cases that cannot be
+  invented, such as an unknown enum member, where you still see what you typed
+  and get an error on that exact cell.
 * Filters apply to stored rows only; the staging block is always visible.
 * No pandas. The hot paths are dictionary and set lookups over a few thousand
   rows; a DataFrame in the middle is slower. Copying the whole table is the

@@ -661,6 +661,53 @@ class StagedTableModel(QAbstractTableModel):
         return "<br>".join(bits)
 
     # --------------------------------------------------------------- editing
+    def value_for(self, col: ColumnSpec, text: str) -> tuple[Any, Optional[str]]:
+        """Cell text -> a value, inventing a dimension value where needed.
+
+        Typing a label a dimension does not have is how a new one gets added,
+        exactly as the "+ New ..." entry does it: having to find that entry to
+        say what the cell already says is a nuisance, and a key column often
+        needs a value nothing references yet.
+
+        What comes back is a placeholder id. It shows in italics, it appears in
+        every drop-down for that column from then on, and it travels in the
+        payload under ``new_dimension_values`` for the receiving API to create
+        before the rows that reference it.
+
+        Enums are not invented -- their members are a Python class -- so an
+        unknown one stays the error it was.
+
+        Returns the value, and the label if one was invented.
+        """
+        value = parse(col, text, self.lookups)
+        if col.fk is None or not isinstance(value, Unresolved):
+            return value, None
+        label = value.text.strip()
+        if not label:
+            return value, None
+        return self.lookups.add_value(col, label), label
+
+    def announce_new_values(self, labels: Sequence[str], header: str = "") -> None:
+        """Say that a value was invented, because nothing else would."""
+        labels = [x for x in labels if x]
+        if not labels:
+            return
+        if len(labels) == 1:
+            what = f"{header + ' ' if header else ''}'{labels[0]}'"
+            self.message.emit(
+                f"{what} added for this session - it is not in the database, "
+                "your API has to create it",
+                False,
+            )
+            return
+        self.message.emit(
+            f"{len(labels)} new value(s) added for this session "
+            f"({', '.join(sorted(set(labels))[:3])}"
+            f"{', ...' if len(set(labels)) > 3 else ''}) - "
+            "not in the database, your API has to create them",
+            False,
+        )
+
     def setData(self, index: QModelIndex, value: Any, role=Qt.ItemDataRole.EditRole) -> bool:
         if role != Qt.ItemDataRole.EditRole or not index.isValid():
             return False
@@ -669,7 +716,9 @@ class StagedTableModel(QAbstractTableModel):
         if row is None:
             return False
         try:
-            parsed = parse(col, "" if value is None else str(value), self.lookups)
+            parsed, invented = self.value_for(
+                col, "" if value is None else str(value)
+            )
         except ValueError as exc:
             self.message.emit(f"{col.header}: {exc}", True)
             return False
@@ -678,6 +727,7 @@ class StagedTableModel(QAbstractTableModel):
         self.undo_stack.push(
             CellEditCommand(self, [(row.uid, col.key, parsed)], f"edit {col.header}")
         )
+        self.announce_new_values([invented], col.header)
         return True
 
     def apply_values(self, changes: Iterable[tuple[int, str, Any]]) -> None:
@@ -2008,6 +2058,7 @@ class GridView(QTableView):
         staging_before = model.staging_snapshot()
         staging_after = [_copy_row(r) for r in staging_before]
         db_changes: list[tuple[int, str, Any]] = []
+        new_values: list[str] = []
 
         for row_offset, line in enumerate(grid):
             target_row = top + row_offset
@@ -2036,10 +2087,12 @@ class GridView(QTableView):
                     skipped += 1
                     continue
                 try:
-                    value = parse(col, raw, model.lookups)
+                    value, invented = model.value_for(col, raw)
                 except ValueError:
                     failed += 1
                     continue
+                if invented:
+                    new_values.append(invented)
                 if anchor_in_staging:
                     row.values[col.key] = value
                 else:
@@ -2066,6 +2119,11 @@ class GridView(QTableView):
             note.append(f"{skipped} read-only cell(s) skipped")
         if failed:
             note.append(f"{failed} cell(s) rejected")
+        if new_values:
+            note.append(
+                f"{len(set(new_values))} new value(s) added for this session, "
+                "which your API has to create"
+            )
         model.message.emit("; ".join(note), bool(failed))
 
     # ------------------------------------------------------------------ fill
@@ -2076,6 +2134,7 @@ class GridView(QTableView):
         staging_before = model.staging_snapshot()
         staging_after = [_copy_row(r) for r in staging_before]
         db_changes: list[tuple[int, str, Any]] = []
+        new_values: list[str] = []
         touched_staging = False
         failed = 0
 
@@ -2090,10 +2149,12 @@ class GridView(QTableView):
             if not editable or row.state is RowState.DELETED:
                 continue
             try:
-                value = parse(col, text, model.lookups)
+                value, invented = model.value_for(col, text)
             except ValueError:
                 failed += 1
                 continue
+            if invented:
+                new_values.append(invented)
             if row.is_staged:
                 if row_index < len(staging_after):
                     staging_after[row_index].values[col.key] = value

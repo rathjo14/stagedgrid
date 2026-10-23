@@ -847,6 +847,11 @@ class Lookups:
         self._ids: dict[str, dict[str, int]] = {}
         self._choices: dict[str, list[str]] = {}
         self._pending: dict[str, dict[int, str]] = {}
+        #: Placeholder ids are handed out from one counter for the whole
+        #: session, not per dimension: `pending()` is keyed by id alone, so
+        #: two dimensions minting -1 would have one overwrite the other and
+        #: the payload would lose a value the API needs to create.
+        self._placeholder = 0
 
     @staticmethod
     def _key(col: ColumnSpec) -> str:
@@ -877,7 +882,7 @@ class Lookups:
         known = self._ids[key].get(text.casefold())
         if known is not None:
             return known
-        new_id = min(min(self._labels[key], default=0), 0) - 1
+        new_id = self._mint()
         self._labels[key][new_id] = text
         self._ids[key][text.casefold()] = new_id
         self._choices[key] = sorted(
@@ -885,6 +890,19 @@ class Lookups:
         )
         self._pending.setdefault(key, {})[new_id] = text
         return new_id
+
+    def _mint(self) -> int:
+        """The next placeholder id: unique across every dimension.
+
+        Below zero, and below anything already in use, so it cannot collide
+        with a real id either.
+        """
+        floor = min(
+            [0, self._placeholder]
+            + [min(labels, default=0) for labels in self._labels.values()]
+        )
+        self._placeholder = floor - 1
+        return self._placeholder
 
     @staticmethod
     def is_pending(pk: Optional[int]) -> bool:

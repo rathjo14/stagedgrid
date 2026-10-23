@@ -64,6 +64,7 @@ from grid import (
 from schema import (
     LABEL_COLUMNS,
     ColumnKind,
+    Lookups,
     ModelE,
     TableSpec,
     Unresolved,
@@ -446,11 +447,97 @@ def test_emptying_the_last_row_collapses_the_extra_blank(model):
     assert model.staged_count == 1
 
 
-def test_staged_row_with_an_unknown_key_is_an_error(model):
-    model.setData(idx(model, 0, "a_id"), "NOT-A-REGION")
+def test_a_label_the_dimension_does_not_have_is_added_not_rejected(model):
+    """Typing a new value into a key column is how a new one gets added.
+
+    It was an error before, which meant a new region had to be invented
+    through the "+ New ..." entry even though the cell already said what it
+    was. Now both paths do the same thing.
+    """
+    col = model.spec["a_id"]
+    assert "NEW-REGION" not in model.lookups.choices(col)
+
+    model.setData(idx(model, 0, "a_id"), "NEW-REGION")
     model.revalidate()
-    assert idx(model, 0, "a_id").data(ROLE_CELL_STATE) == CELL_ERROR
-    assert model.dirty_counts()["errors"] == 1
+    row = model.row_at(0)
+
+    assert "a_id" not in row.errors
+    assert idx(model, 0, "a_id").data(ROLE_CELL_STATE) != CELL_ERROR
+    assert idx(model, 0, "a_id").data(Qt.ItemDataRole.DisplayRole) == "NEW-REGION"
+
+    # a placeholder id, so staged rows can point at it like any other value
+    assert Lookups.is_pending(row.values["a_id"])
+    # and it is offered from then on, in this column's every drop-down
+    assert "NEW-REGION" in model.lookups.choices(col)
+    # shown in italics, with the tooltip saying who has to create it
+    assert idx(model, 0, "a_id").data(Qt.ItemDataRole.FontRole).italic()
+    assert "has to create it" in idx(model, 0, "a_id").data(
+        Qt.ItemDataRole.ToolTipRole
+    )
+
+
+def _fill_key(model, **overrides):
+    """Give row 0 a complete natural key, using values the dimensions have."""
+    picked = {}
+    for key in ("a_id", "b_id", "c_id", "d_id"):
+        text = overrides.get(key) or model.lookups.choices(model.spec[key])[0]
+        picked[key] = text
+        model.setData(idx(model, 0, key), text)
+    picked["type"] = overrides.get("type", "BASELINE")
+    model.setData(idx(model, 0, "type"), picked["type"])
+    model.revalidate()
+    return picked
+
+
+def test_an_invented_value_travels_in_the_payload(model, repo):
+    """It is not in the database, so the receiving API has to be told."""
+    _fill_key(model, a_id="NEW-REGION")
+    assert not model.row_at(0).errors, model.row_at(0).errors
+
+    payload = model.changeset().to_payload()
+    invented = payload["new_dimension_values"]
+    assert [v["label"] for v in invented] == ["NEW-REGION"]
+    assert invented[0]["table"] == "model_a"
+    assert invented[0]["column"] == "name"
+    assert invented[0]["placeholder_id"] < 0
+    # the insert references it by that placeholder id
+    insert = next(op for op in payload["operations"] if op["op"] == "insert")
+    assert insert["key"]["a_id"] == invented[0]["placeholder_id"]
+    # and the label is there in readable form too
+    assert insert["key_labels"]["a_id"] == "NEW-REGION"
+
+
+def test_placeholder_ids_do_not_collide_across_dimensions(model, repo):
+    """They were minted per dimension, so the first new value in each got -1.
+
+    `pending()` is keyed by id alone, so one would overwrite another and the
+    payload would quietly lose a value the API has to create -- while handing
+    it a -1 that meant two different things.
+    """
+    _fill_key(model, a_id="NEW-REGION", b_id="NEW-DESK", c_id="NEW-BOOK")
+    row = model.row_at(0)
+
+    ids = [row.values[k] for k in ("a_id", "b_id", "c_id")]
+    assert all(Lookups.is_pending(i) for i in ids)
+    assert len(set(ids)) == 3, f"placeholder ids collided: {ids}"
+
+    invented = model.changeset().to_payload()["new_dimension_values"]
+    assert sorted(v["label"] for v in invented) == [
+        "NEW-BOOK", "NEW-DESK", "NEW-REGION"
+    ]
+    assert sorted(v["table"] for v in invented) == ["model_a", "model_b", "model_c"]
+    # each row value points at exactly one of them
+    by_id = {v["placeholder_id"]: v for v in invented}
+    assert {row.values["a_id"], row.values["b_id"], row.values["c_id"]} == set(by_id)
+
+
+def test_an_unknown_enum_member_is_still_an_error(model):
+    """A dimension row can be created; an enum member cannot -- it is a class."""
+    model.setData(idx(model, 0, "type"), "NOT-A-TYPE")
+    model.revalidate()
+    row = model.row_at(0)
+    assert row.errors.get("type")
+    assert idx(model, 0, "type").data(ROLE_CELL_STATE) == CELL_ERROR
 
 
 def test_duplicate_of_an_existing_row_is_an_error(model, repo):
