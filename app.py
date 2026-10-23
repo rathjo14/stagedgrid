@@ -59,6 +59,8 @@ _use_venv_if_needed()
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
+    QColor,
     QKeySequence,
     QUndoStack,
 )
@@ -70,7 +72,9 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QInputDialog,
     QGroupBox,
+    QDockWidget,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -85,8 +89,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from schema import ColumnSpec, ModelE, describe, dsn, make_engine
-from data import ColumnFilter, Condition, Join, Op, Repository, ops_for
+from schema import ColumnSpec, Lookups, ModelE, describe, dsn, make_engine
+from data import Branch, ColumnFilter, Condition, Join, Op, Repository, ops_for
+from sqlview import SqlView, Untranslatable, ViewQuery
 import grid
 from grid import GridView, StagedTableModel, set_theme, stylesheet
 
@@ -94,6 +99,16 @@ import qdarktheme    # the window chrome
 import darkdetect     # which way "auto" goes (Qt only knows from 6.5)
 
 BLANKS_LABEL = "(Blanks)"   # how an empty value reads in the filter checklist
+
+#: How many rows to fetch at a time, offered in Data > Load in chunks of.
+#: The first chunk paints the window; the rest arrive in the background until
+#: the whole version is here, so sorting and searching stay global. None
+#: fetches everything in one query.
+CHUNK_SIZES = (None, 500, 1_000, 2_500, 5_000, 10_000)
+DEFAULT_CHUNK_SIZE = 2_500
+
+#: Commit goes this colour when there is something to push.
+COMMIT_READY = QColor("#7B4FBF")
 
 SHORTCUTS = [
     ("Ctrl+C / Ctrl+Shift+C", "Copy selection / copy with headers"),
@@ -421,27 +436,62 @@ class MainWindow(QMainWindow):
         sink: Optional[Callable[[dict[str, Any]], str]] = None,
         limit: Optional[int] = None,
         parent=None,
+        read_only: bool = False,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
         self.sink = sink or file_sink()
         self.limit = limit
-        self._first_load = True
 
         self.setWindowTitle(f"stagedgrid - {repository.spec.table_name}")
         self.resize(1480, 840)
         self.setStyleSheet(stylesheet())
 
+        self.read_only = read_only
+        #: In read-only mode the database does the ordering, filtering and
+        #: searching, so only a capped slice is ever held. That is what lets
+        #: any mapped class be opened, however large.
+        self.sql_view = (
+            SqlView(repository.model, repository.spec, Lookups())
+            if read_only
+            else None
+        )
+        self._requerying = False
+        self._sql_total = 0
+        #: How many matching rows a read-only grid will hold at once. The
+        #: ordering and filtering still cover the whole table; this only caps
+        #: what is fetched for display, so memory does not follow table size.
+        self.read_only_cap = limit or 2_000
         self.undo_stack = QUndoStack(self)
-        self.model = StagedTableModel(repository.spec, undo_stack=self.undo_stack)
+        self.model = StagedTableModel(
+            repository.spec, undo_stack=self.undo_stack, read_only=read_only
+        )
         self.view = GridView(self.model, self)
         self.setCentralWidget(self.view)
+        self.branch: Optional[Branch] = None
+        self.chunk_size: Optional[int] = (
+            limit if limit is not None else DEFAULT_CHUNK_SIZE
+        )
+        self.total_rows = 0
+        self._loading = False
+        self._load_timer = QTimer(self)
+        self._load_timer.setSingleShot(True)
+        self._load_timer.timeout.connect(self._load_next_chunk)
+        self._commit_button = None
+        # A bound method, not a lambda: Qt drops the connection when this
+        # window is destroyed, instead of calling into a deleted stack.
+        self.undo_stack.cleanChanged.connect(self._on_clean_changed)
+        self._build_branch_dock()
 
         self._build_actions()
         self._build_toolbar()
         self._build_menus()
         self._build_status_bar()
+        if read_only:
+            self._strip_editing_chrome()
 
+        if read_only:
+            self.model.viewChanged.connect(self._requery)
         self.view.filterRequested.connect(self.show_filter_dialog)
         self.view.statsChanged.connect(self._stats_label.setText)
         self.model.stateChanged.connect(self._refresh)
@@ -450,6 +500,42 @@ class MainWindow(QMainWindow):
         self.reload()
 
     # ------------------------------------------------------------- chrome
+    def _strip_editing_chrome(self) -> None:
+        """Hide everything that only makes sense when you can edit."""
+        for action in (
+            self.action_add_row, self.action_delete, self.action_revert,
+            self.action_undo, self.action_redo, self.action_commit,
+            self.action_branches, self.action_export, self.action_show_deleted,
+        ):
+            action.setVisible(False)
+            action.setEnabled(False)
+        self.branch_dock.hide()
+        self.deleted_toggle.hide()
+        self.setWindowTitle(
+            f"{self.windowTitle()} - read only"
+        )
+
+    def _build_branch_dock(self) -> None:
+        """A collapsible list of branches in the Updates table.
+
+        Picking one opens the version it was made against and replays its
+        stored changes on top; the first entry is a fresh branch.
+        """
+        self.branch_list = QListWidget()
+        self.branch_list.setAlternatingRowColors(True)
+        self.branch_list.currentItemChanged.connect(
+            lambda item, _prev: item is not None
+            and self.open_branch(item.data(Qt.ItemDataRole.UserRole))
+        )
+        self.branch_dock = QDockWidget("Branches", self)
+        self.branch_dock.setWidget(self.branch_list)
+        self.branch_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.branch_dock)
+        self.branch_dock.hide()        # collapsed until asked for
+
     def _build_actions(self) -> None:
         self.action_reload = QAction("Reload", self)
         self.action_reload.setShortcut(QKeySequence.StandardKey.Refresh)
@@ -477,6 +563,22 @@ class MainWindow(QMainWindow):
 
         self.action_clear_sort = QAction("Clear sort", self)
         self.action_clear_sort.triggered.connect(self.model.clear_sort)
+
+        self.chunk_actions = []
+        for size in CHUNK_SIZES:
+            action = QAction("Everything at once" if size is None
+                             else f"{size:,} rows", self)
+            action.setCheckable(True)
+            action.setData(size)
+            action.triggered.connect(
+                lambda _checked, chosen=size: self.set_chunk_size(chosen)
+            )
+            self.chunk_actions.append(action)
+
+        self.action_branches = QAction("Branches", self)
+        self.action_branches.setCheckable(True)
+        self.action_branches.setShortcut("Ctrl+B")
+        self.action_branches.toggled.connect(self._show_branches)
 
         self.action_dark = QAction("Dark mode", self)
         self.action_dark.setCheckable(True)
@@ -544,7 +646,9 @@ class MainWindow(QMainWindow):
         self.action_show_deleted.toggled.connect(self.deleted_toggle.setChecked)
         bar.addWidget(self.deleted_toggle)
         bar.addSeparator()
+        bar.addAction(self.action_branches)
         bar.addAction(self.action_commit)
+        self._commit_button = bar.widgetForAction(self.action_commit)
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -570,6 +674,15 @@ class MainWindow(QMainWindow):
         data_menu.addAction(self.action_clear_sort)
         data_menu.addAction(self.action_show_deleted)
         data_menu.addAction(self.action_fit)
+        data_menu.addSeparator()
+        chunks = data_menu.addMenu("Load in chunks of")
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        for action in self.chunk_actions:
+            group.addAction(action)
+            chunks.addAction(action)
+        data_menu.addSeparator()
+        data_menu.addAction(self.action_branches)
         data_menu.addAction(self.action_dark)
         data_menu.addSeparator()
         data_menu.addAction(self.action_commit)
@@ -594,12 +707,23 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------------- data
     def reload(self) -> None:
+        self._stop_loading()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             lookups = self.repository.load_lookups()
-            rows = self.repository.load_rows(limit=self.limit)
+            if self.read_only:
+                self.sql_view.lookups = lookups
+                rows = self._sql_rows()
+                self.total_rows = self._sql_total
+            else:
+                version_id = self.branch.version_id if self.branch else None
+                self.total_rows = self.repository.count_rows(version_id=version_id)
+                rows = self.repository.load_rows(
+                    limit=self.chunk_size, version_id=version_id
+                )
             self.model.load(rows, lookups)
             self.model.validator.set_existing_keys(self.repository.natural_keys())
+            replayed = self.model.replay(self.branch.changes) if self.branch else None
         except Exception as exc:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(
@@ -607,39 +731,269 @@ class MainWindow(QMainWindow):
             )
             return
         QApplication.restoreOverrideCursor()
-        note = f"Loaded {len(rows)} row(s) from {self.repository.spec.table_name}"
-        if self._first_load:
-            self._first_load = False
-            note += self._filter_to_latest_version()
+        note = f"Loaded {len(rows):,} row(s) from {self.repository.spec.table_name}"
+        if self.read_only and len(rows) < self._sql_total:
+            note += f" (first {len(rows):,} of {self._sql_total:,} matching)"
+        # Read-only mode fetches exactly the capped slice the database was
+        # asked for; there is no "rest" to stream in behind it.
+        self._loading = not self.read_only and len(rows) < self.total_rows
+        if self._loading:
+            note += f"   |   fetching the rest of {self.total_rows:,}..."
+            self._load_timer.start(0)
+        version = self.repository.version_column
+        if version is not None:
+            shown = (
+                self.branch.version_label
+                if self.branch
+                else (self.repository.latest_version() or (None, ""))[1]
+            )
+            note += f"   |   {version.header} {shown}"
+        if replayed:
+            note += (
+                f"   |   branch {self.branch.label or self.branch.id}: "
+                f"+{replayed['inserts']} ~{replayed['updates']} "
+                f"-{replayed['deletes']}"
+            )
+            if replayed["missing"]:
+                note += f" ({replayed['missing']} row(s) no longer exist)"
+        self._refresh_branches()
+        self._sync_chunk_actions()
         self.flash(note)
 
-    def _version_column(self) -> Optional[ColumnSpec]:
-        """The natural-key foreign key that points at a version dimension."""
-        for col in self.model.spec.key_columns:
-            if col.fk is not None and col.fk.label_attr in ("version", "revision"):
-                return col
-        return None
+    # ------------------------------------------------------------ branches
+    def _show_branches(self, shown: bool) -> None:
+        self.branch_dock.setVisible(shown)
+        if shown:
+            self._refresh_branches()
 
-    def _filter_to_latest_version(self) -> str:
-        """Open on the newest version only; clearing the filter shows them all."""
-        col = self._version_column()
-        if col is None:
-            return ""
-        choices = self.model.lookups.choices(col)  # naturally sorted, newest last
-        if not choices:
-            return ""
-        latest = choices[-1]
-        self.model.set_filter(ColumnFilter(key=col.key, allowed=frozenset({latest})))
-        return f"   |   filtered to {col.header} {latest} (newest of {len(choices)})"
+    # ------------------------------------------------- read-only, sql side
+    def _sql_query(self) -> "ViewQuery":
+        return ViewQuery(
+            sort=tuple(self.model.sort_keys),
+            filters=self.model.filters,
+            search=self.model.quick_search,
+            limit=self.read_only_cap,
+        )
+
+    def _sql_rows(self) -> list:
+        """Ask the database for the current view, capped for display."""
+        query = self._sql_query()
+        self._sql_total = self.sql_view.count(self.repository.engine, query)
+        return self.sql_view.rows(self.repository.engine, query)
+
+    def _requery(self) -> None:
+        """The sort or filter moved: ask the database again, not the rows here.
+
+        This is what makes ordering and filtering cover the whole table in
+        read-only mode rather than only what is loaded.
+        """
+        if self._requerying or not self.read_only:
+            return
+        self._requerying = True
+        try:
+            rows = self._sql_rows()
+            self.model.load(rows, self.model.lookups)
+        except Untranslatable as exc:
+            # No SQL for this one, so the grid falls back to filtering the rows
+            # it holds. That is a real answer, but only about those rows, and
+            # saying so is the difference between a limit and a wrong result.
+            held = self.model.rowCount()
+            self.flash(
+                f"{exc} -- matched {held:,} of the "
+                f"{self._sql_total:,} loaded row(s) only, not the whole table",
+                True,
+            )
+        except Exception as exc:
+            self.flash(f"Query failed: {exc}", True)
+        else:
+            shown, total = len(rows), self._sql_total
+            self.flash(
+                f"{total:,} row(s) match"
+                + (f", showing the first {shown:,}" if shown < total else "")
+            )
+        finally:
+            self._requerying = False
+
+    # --------------------------------------------------- background loading
+    def _load_next_chunk(self) -> None:
+        """Fetch the next chunk and add it, keeping the window responsive.
+
+        One chunk per event-loop turn: the user can scroll, type and search
+        while the rest arrives.
+        """
+        if not self._loading:
+            return
+        loaded = self.model.total_db_rows()
+        if loaded >= self.total_rows:
+            self._finish_loading()
+            return
+        try:
+            rows = self.repository.load_rows(
+                limit=self.chunk_size,
+                offset=loaded,
+                version_id=self.branch.version_id if self.branch else None,
+            )
+        except Exception as exc:  # pragma: no cover - surfaced in the status bar
+            self._loading = False
+            self.flash(f"Could not fetch the rest: {exc}", True)
+            return
+        if not rows:
+            self._finish_loading()
+            return
+        self.model.append_rows(rows)
+        now = self.model.total_db_rows()
+        self.flash(f"Loading... {now:,} of {self.total_rows:,}")
+        if now >= self.total_rows:
+            self._finish_loading()
+        else:
+            self._load_timer.start(0)
+
+    def _finish_loading(self) -> None:
+        self._loading = False
+        self.flash(
+            f"All {self.model.total_db_rows():,} row(s) loaded"
+            + (f" for branch {self.branch.label or self.branch.id}"
+               if self.branch else "")
+        )
+        self._refresh()
+
+    def _stop_loading(self) -> None:
+        self._loading = False
+        self._load_timer.stop()
+
+    def set_chunk_size(self, size: Optional[int]) -> None:
+        if size == self.chunk_size:
+            return
+        self.chunk_size = size
+        self._sync_chunk_actions()
+        self.flash(
+            "Everything is fetched in one query" if size is None
+            else f"Fetching {size:,} rows at a time from now on"
+        )
+
+    def _may_reload(self, why: str) -> bool:
+        """Ask before throwing away edits that have not been pushed."""
+        if not self.unsaved_changes():
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Discard changes?",
+            f"{why}\n\nThe changes you have made since loading have not been "
+            "committed. Discard them?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _sync_chunk_actions(self) -> None:
+        for action in self.chunk_actions:
+            action.setChecked(action.data() == self.chunk_size)
+
+    def unsaved_changes(self) -> bool:
+        """Has anything been edited since the grid was loaded?
+
+        A branch's own changes come back as pending edits, so "is the grid
+        dirty" is the wrong question -- it always is. What matters is whether
+        the user has done anything on top, which is exactly what the undo
+        stack tracks: loading clears it, editing dirties it, and undoing back
+        to the start makes it clean again.
+        """
+        return not self.undo_stack.isClean()
+
+    def open_branch(self, branch_id: Optional[int]) -> None:
+        """Show a branch's changes on top of the version it was made against."""
+        if not self._may_reload("Opening a branch reloads the grid."):
+            self._refresh_branches()          # put the selection back
+            return
+        self.branch = (
+            self.repository.load_branch(branch_id) if branch_id is not None else None
+        )
+        self.reload()
+
+    def _refresh_branches(self) -> None:
+        """Repopulate the branch list, keeping the current one selected."""
+        if not hasattr(self, "branch_list"):
+            return
+        self.branch_list.blockSignals(True)
+        self.branch_list.clear()
+        new_row = QListWidgetItem("(new branch)")
+        new_row.setData(Qt.ItemDataRole.UserRole, None)
+        self.branch_list.addItem(new_row)
+        try:
+            branches = self.repository.list_branches()
+        except Exception as exc:  # the table may not exist yet
+            branches = []
+            self.branch_list.addItem(QListWidgetItem(f"- {exc}"[:60]))
+        for branch in branches:
+            item = QListWidgetItem(branch.summary())
+            item.setData(Qt.ItemDataRole.UserRole, branch.id)
+            self.branch_list.addItem(item)
+        current = self.branch.id if self.branch else None
+        for i in range(self.branch_list.count()):
+            if self.branch_list.item(i).data(Qt.ItemDataRole.UserRole) == current:
+                self.branch_list.setCurrentRow(i)
+                break
+        self.branch_list.blockSignals(False)
+        self.branch_dock.setWindowTitle(
+            f"Branches - {self.branch.label or self.branch.id}" if self.branch
+            else "Branches - new"
+        )
 
     def _refresh(self) -> None:
         counts = self.model.dirty_counts()
         self._counts_label.setText(
-            f"  {self.model.total_db_rows()} row(s), showing "
-            f"{self.model.visible_db_rows()}   |   "
+            f"  {self.model.total_db_rows():,} row(s)"
+            + (f" of {self.total_rows:,}" if self._loading else "")
+            + f", showing {self.model.visible_db_rows()}"
+            + (
+                # Until everything is here, a sort or search only covers what
+                # has arrived. Say so rather than let it look complete.
+                " (still loading - covers the rows fetched so far)"
+                if self._loading and self._view_is_narrowed()
+                else ""
+            )
+            + "   |   "
             f"+{counts['inserts']}  ~{counts['updates']}  -{counts['deletes']}"
             + (f"   |   {counts['errors']} problem(s)" if counts["errors"] else "")
         )
+        self._refresh_commit_button()
+
+    def _on_clean_changed(self, _clean: bool) -> None:
+        self._refresh_commit_button()
+
+    def _view_is_narrowed(self) -> bool:
+        """Is a sort, filter or search in force?"""
+        return bool(
+            self.model.sort_keys
+            or self.model.filters.active_keys()
+            or self.model.quick_search
+        )
+
+    def _refresh_commit_button(self) -> None:
+        """Commit only lights up when there is something to push."""
+        pending = self.unsaved_changes()
+        blocked = bool(self.model.dirty_counts()["errors"])
+        self.action_commit.setEnabled(pending and not blocked)
+        where = (
+            f"branch {self.branch.label or self.branch.id}"
+            if self.branch
+            else "a new branch"
+        )
+        self.action_commit.setToolTip(
+            "Nothing to commit - nothing has changed since this was loaded"
+            if not pending
+            else f"Fix the {self.model.dirty_counts()['errors']} highlighted row(s) first"
+            if blocked
+            else f"Push these changes to {where}"
+        )
+        button = self._commit_button
+        if button is not None:
+            button.setStyleSheet(
+                f"QToolButton {{ background: {COMMIT_READY.name()}; "
+                f"color: white; border-radius: 3px; padding: 2px 10px; }}"
+                if pending and not blocked
+                else ""
+            )
 
     def toggle_dark(self, dark: bool) -> None:
         """Repaint everything in the other palette."""
@@ -729,35 +1083,69 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Replay the whole changeset inside a transaction and roll it back, so
-        # the database gets the last word before we ask for confirmation.
-        dry = self.repository.apply(changeset, dry_run=True)
-        if not dry.ok:
+        # The fact table is never written here. A commit is a push to a branch
+        # in the Updates table; applying branches happens elsewhere.
+        if self.repository.updates is None:
             QMessageBox.critical(
-                self, "Commit", f"The database rejected the changes:\n\n{dry.error}"
+                self,
+                "Commit",
+                "No Updates table is configured, so there is nowhere to put "
+                "these changes.",
             )
             return
 
+        where = (
+            f"branch {self.branch.label or self.branch.id}"
+            if self.branch
+            else "a new branch"
+        )
         answer = QMessageBox.question(
             self,
             "Commit",
-            f"Apply to {self.repository.spec.table_name}?\n\n{changeset.summary()}",
+            f"Push to {where}?\n\n{changeset.summary()}\n\n"
+            f"{self.repository.spec.table_name} itself is not changed.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        result = self.repository.apply(changeset)
-        if not result.ok:
-            QMessageBox.critical(self, "Commit failed", result.error)
+        label = self.branch.label if self.branch else ""
+        if self.branch is None:
+            label, named = QInputDialog.getText(
+                self, "New branch", "Name for this branch (optional):"
+            )
+            if not named:
+                return
+
+        payload = changeset.to_payload()
+        try:
+            branch_id = self.repository.save_branch(
+                payload,
+                version_id=(
+                    self.branch.version_id
+                    if self.branch
+                    else (self.repository.latest_version() or (None,))[0]
+                ),
+                branch_id=self.branch.id if self.branch else None,
+                label=label or None,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Commit failed", str(exc))
             return
         try:
-            note = self.sink(changeset.to_payload()) or "changeset sent"
+            note = self.sink(payload) or ""
         except Exception as exc:  # the sink is the owner's code
             note = f"sink failed: {exc}"
+
+        # Reopen what was just pushed, so the screen shows what is stored
+        # rather than what happened to be in memory.
+        self.branch = self.repository.load_branch(branch_id)
         self.reload()
-        self.flash(f"{result.summary()}. {note}")
+        self.flash(
+            f"Pushed {changeset.summary()} to branch "
+            f"{self.branch.label or branch_id}. {note}".strip()
+        )
 
     def export_changeset(self) -> None:
         changeset = self.model.changeset()
@@ -790,18 +1178,31 @@ class MainWindow(QMainWindow):
             )
 
         body = (
+            "<p><b>The two halves</b> are told apart by grey, so colour can "
+            "mean something.</p>"
             "<table cellspacing='4'>"
-            + swatch(grid.C.staged_row, "staged insert (natural key is editable here)")
-            + swatch(grid.C.staged_blank, "the always-blank row: type or paste to add more")
-            + swatch(grid.C.updated_row, "row with pending edits")
-            + swatch(grid.C.updated_cell, "the edited cell itself")
-            + swatch(grid.C.key_readonly, "natural key on an existing row (not editable)")
-            + swatch(grid.C.error_cell, "validation error - hover for the reason")
-            + swatch(grid.C.warning_cell, "warning")
+            + swatch(grid.C.staged_blank, "the new-data area, lighter grey; the "
+                                          "<b>+</b> row is where you type or paste")
+            + swatch(grid.C.base, "rows already in the database")
+            + swatch(grid.C.key_readonly, "the natural key of a stored row, locked")
             + "</table>"
-            "<p>A deleted row leaves the grid and a red triangle marks where it "
-            "was, in the gutter on the left. Click the triangle to bring it "
-            "back, or turn on <i>Show deleted</i>.</p>"
+            "<p><b>Then colour says what is happening.</b></p>"
+            "<table cellspacing='4'>"
+            + swatch(grid.C.staged_invalid, "a new row that does not pass yet. The "
+                                            "gutter shows <b>!!!</b> and the whole "
+                                            "natural key is outlined; hover a cell "
+                                            "for the reason")
+            + swatch(grid.C.staged_row, "a new row that passes and is ready to commit")
+            + swatch(grid.C.updated_row, "a stored row with pending edits")
+            + swatch(grid.C.updated_cell, "the edited cell itself")
+            + swatch(grid.C.deleted_row, "deleted (only visible with "
+                                         "<i>Show deleted</i>)")
+            + "</table>"
+            "<p>A deleted row otherwise leaves the grid and a red triangle marks "
+            "where it was, in the gutter on the left. Click the triangle to bring "
+            "it back.</p>"
+            "<p>Selecting cells tints them grey rather than recolouring them, so "
+            "a selected row still shows its state.</p>"
         )
         self._info_dialog("Colour legend", body)
 
@@ -859,6 +1260,12 @@ def demo_schema_hint(repository, exc: Exception) -> str:
     """
     if repository.model is not ModelE:
         return ""
+    text = str(exc).lower()
+    if not any(
+        phrase in text
+        for phrase in ("does not exist", "no such table", "undefinedtable")
+    ):
+        return ""   # nothing to do with which schema is configured
     return (
         "\n\nNote: no model was configured, so this is the bundled DEMO schema "
         f"({ModelE.__tablename__}), which does not exist in that database.\n\n"
@@ -929,6 +1336,13 @@ def main(argv: list[str] | None = None) -> int:
              "wrong -- see --describe.",
     )
     parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="open any mapped class read-only: the database does the "
+             "ordering, filtering and searching, so table size does not "
+             "become memory. No editing, no staging row, no branches.",
+    )
+    parser.add_argument(
         "--describe",
         action="store_true",
         help="print what the grid worked out about the table, and exit",
@@ -986,7 +1400,10 @@ def main(argv: list[str] | None = None) -> int:
     apply_theme(app, args.theme)
 
     window = MainWindow(
-        repository, sink=file_sink(args.changesets), limit=args.limit
+        repository,
+        sink=file_sink(args.changesets),
+        limit=args.limit,
+        read_only=args.read_only,
     )
     window.show()
     return app.exec()

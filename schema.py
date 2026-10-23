@@ -19,6 +19,7 @@ from itertools import product
 from typing import Any, Iterable, Optional
 
 from sqlalchemy import (
+    DateTime,
     Enum as SAEnum,
     Float,
     ForeignKey,
@@ -27,6 +28,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
+    func,
     inspect,
     select,
 )
@@ -268,6 +270,81 @@ class ModelE(Base):
             f"<ModelE id={self.id} "
             f"key=({self.a_id},{self.b_id},{self.c_id},{self.d_id},{self.type})>"
         )
+
+
+class Updates(Base):
+    """Staged changes to the fact table, one row per branch.
+
+    A stand-in for the real ``Updates`` table, the same way ModelA-E stand in
+    for the real fact schema: swap it for yours with ``--updates-model``. Only
+    the shape matters -- somewhere to put the JSON, which version it is
+    against, and when it last moved.
+    """
+
+    __tablename__ = "updates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[Optional[str]] = mapped_column(
+        String(128), doc="What this branch of changes is called."
+    )
+    d_id: Mapped[int] = mapped_column(
+        ForeignKey("model_d.id"),
+        nullable=False,
+        doc="The version these changes were made against.",
+    )
+    changes: Mapped[dict] = mapped_column(
+        JsonColumn, nullable=False, default=dict,
+        doc="The staged changes, as json.",
+    )
+    modified_at: Mapped[Optional[object]] = mapped_column(
+        DateTime(timezone=True),
+        default=func.now(),
+        onupdate=func.now(),
+        doc="Bumped every time the branch is pushed to.",
+    )
+
+
+@dataclass
+class UpdatesSpec:
+    """Where the branch table keeps each thing, worked out from the mapper.
+
+    Nothing here is hard-coded to the demo ``Updates`` class: point
+    ``--updates-model`` at yours and the columns are found by type.
+    """
+
+    model: type
+    pk: str
+    changes: str                    # the json column
+    version: Optional[str] = None   # foreign key to the version dimension
+    modified_at: Optional[str] = None
+    label: Optional[str] = None     # a human name for the branch
+
+    @classmethod
+    def from_mapped_class(
+        cls, model: type, version_table: Optional[str] = None
+    ) -> "UpdatesSpec":
+        mapper = inspect(model)
+        table = mapper.local_table
+        found = {"changes": None, "version": None, "modified_at": None, "label": None}
+        for col in table.columns:
+            attr = _attr_name(mapper, col)
+            kind = _kind_for(col)
+            if kind is ColumnKind.JSON and found["changes"] is None:
+                found["changes"] = attr
+            elif kind is ColumnKind.FK and found["version"] is None:
+                target = next(iter(col.foreign_keys)).column.table.name
+                if version_table is None or target == version_table:
+                    found["version"] = attr
+            elif kind is ColumnKind.DATETIME and found["modified_at"] is None:
+                found["modified_at"] = attr
+            elif kind is ColumnKind.STR and found["label"] is None:
+                found["label"] = attr
+        if found["changes"] is None:
+            raise ValueError(
+                f"{model.__name__} has no json column to keep the changes in"
+            )
+        pk = _attr_name(mapper, list(table.primary_key.columns)[0])
+        return cls(model=model, pk=pk, **found)
 
 
 #: Parent table -> column shown instead of the raw id.  Auto-detected when a
@@ -745,7 +822,7 @@ def to_db(col: ColumnSpec, value: Any) -> Any:
 # lookups
 
 
-def _natural_sort_key(text: str) -> list:
+def natural_sort_key(text: str) -> list:
     """Digits compare as numbers, so ``2026.2`` sorts before ``2026.10``."""
     parts: list[object] = []
     digits = ""
@@ -781,7 +858,7 @@ class Lookups:
         labels = {int(pk): "" if label is None else str(label) for pk, label in pairs}
         self._labels[key] = labels
         self._ids[key] = {text.casefold(): pk for pk, text in labels.items()}
-        self._choices[key] = sorted(labels.values(), key=_natural_sort_key)
+        self._choices[key] = sorted(labels.values(), key=natural_sort_key)
         self._pending.pop(key, None)  # the database is the truth again
 
     # -- values invented in this session --------------------------------
@@ -804,7 +881,7 @@ class Lookups:
         self._labels[key][new_id] = text
         self._ids[key][text.casefold()] = new_id
         self._choices[key] = sorted(
-            self._labels[key].values(), key=_natural_sort_key
+            self._labels[key].values(), key=natural_sort_key
         )
         self._pending.setdefault(key, {})[new_id] = text
         return new_id
@@ -908,16 +985,52 @@ def reset(engine: Engine) -> None:
     Base.metadata.create_all(engine)
 
 
-def seed(engine: Engine, rows: int = 400, seed_value: int = 7) -> int:
-    """Fill the dimensions and add up to ``rows`` new model_e rows."""
+def _grown(base: list[str], wanted: int) -> list[str]:
+    """``base``, extended with numbered variants until it is long enough."""
+    values = list(base)
+    while len(values) < wanted:
+        values.append(f"{base[len(values) % len(base)]}-{len(values):03d}")
+    return values
+
+
+def _dimension_sizes(rows: int, versions: int) -> tuple[int, int, int]:
+    """How many A/B/C values it takes to hold ``rows`` rows.
+
+    The natural key is A x B x C x D x type, so the dimensions have to be big
+    enough to make that many distinct combinations.
+    """
+    import math
+
+    # Twice the minimum, so the table is about half full and there is room to
+    # actually add rows: sized to just fit, almost every key is taken and
+    # every new row would be a duplicate.
+    need = 2 * math.ceil(rows / max(versions * len(EType), 1))
+    a = max(len(A_VALUES), math.ceil(need ** (1 / 3)))
+    b = max(len(B_VALUES), math.ceil((need / a) ** 0.5))
+    c = max(len(C_VALUES), math.ceil(need / (a * b)))
+    return a, b, c
+
+
+def seed(
+    engine: Engine,
+    rows: int = 400,
+    seed_value: int = 7,
+    one_version: bool = False,
+) -> int:
+    """Fill the dimensions and add up to ``rows`` new model_e rows.
+
+    ``one_version`` puts every row in the newest version, which is how a real
+    table tends to look: the grid only ever loads the newest one.
+    """
     rng = random.Random(seed_value)
     Base.metadata.create_all(engine)
 
+    size_a, size_b, size_c = _dimension_sizes(rows, 1 if one_version else len(D_VALUES))
     with Session(engine) as s, s.begin():
         if s.execute(select(ModelA)).first() is None:
-            s.add_all([ModelA(name=v) for v in A_VALUES])
-            s.add_all([ModelB(name=v) for v in B_VALUES])
-            s.add_all([ModelC(name=v) for v in C_VALUES])
+            s.add_all([ModelA(name=v) for v in _grown(A_VALUES, size_a)])
+            s.add_all([ModelB(name=v) for v in _grown(B_VALUES, size_b)])
+            s.add_all([ModelC(name=v) for v in _grown(C_VALUES, size_c)])
             s.add_all([ModelD(version=v) for v in D_VALUES])
 
     with Session(engine) as s, s.begin():
@@ -932,6 +1045,11 @@ def seed(engine: Engine, rows: int = 400, seed_value: int = 7) -> int:
                 select(ModelE.a_id, ModelE.b_id, ModelE.c_id, ModelE.d_id, ModelE.type)
             ).all()
         }
+        if one_version:
+            d_ids = [max(
+                s.execute(select(ModelD.id, ModelD.version)).all(),
+                key=lambda pair: natural_sort_key(str(pair[1])),
+            )[0]]
         combos = [
             combo
             for combo in product(a_ids, b_ids, c_ids, d_ids, list(EType))
@@ -981,6 +1099,11 @@ if __name__ == "__main__":
     parser.add_argument("--rows", type=int, default=400)
     parser.add_argument("--reset", action="store_true", help="drop and recreate")
     parser.add_argument("--dsn", default=None)
+    parser.add_argument(
+        "--one-version",
+        action="store_true",
+        help="put every row in the newest version, as a real table tends to be",
+    )
     args = parser.parse_args()
 
     target = make_engine(args.dsn)
@@ -988,4 +1111,5 @@ if __name__ == "__main__":
     if args.reset:
         reset(target)
         print("schema dropped and recreated")
-    print(f"inserted {seed(target, rows=args.rows)} {ModelE.__tablename__} rows")
+    added = seed(target, rows=args.rows, one_version=args.one_version)
+    print(f"inserted {added} {ModelE.__tablename__} rows")

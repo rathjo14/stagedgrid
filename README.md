@@ -11,11 +11,13 @@ changeset that is handed to another API on commit.
 ```bash
 source .venv/Scripts/activate     # or .venv\Scripts\activate.bat on cmd
 python app.py                     # the grid
+python app.py --read-only --model yourrepo.models:Invoice   # any table, read-only
 python schema.py --reset --rows 400   # (re)seed the demo data
-python -m pytest                  # 58 tests, no server needed (sqlite)
+python schema.py --reset --rows 10000 --one-version   # a realistic single version
+python -m pytest                  # 107 tests, no server needed (sqlite)
 ```
 
-There is no package and nothing to install: four modules in one folder that
+There is no package and nothing to install: five modules in one folder that
 import each other by name. `python app.py` works from anywhere, because
 Python puts the script's own folder on the import path.
 
@@ -34,28 +36,31 @@ pandas is deliberately not used -- see the note in `requirements.txt`.
 
 The DSN defaults to `postgresql+psycopg2://postgres:postgres@localhost:5432/benchmark`;
 override with `STAGEDGRID_DSN` or `--dsn`. `--limit N` caps the initial load,
-`--changesets DIR` says where committed payloads are written.
+`--changesets DIR` says where committed payloads are written, and
+`--read-only` opens any model without the editing side.
 
-## The four files
+## The five files
 
 ```
 schema.py    the models, and everything that reads them
 data.py      what is pending, and talking to the database   <- your entry point
+sqlview.py   the same view, expressed as one SQL statement
 grid.py      the table widget
 app.py       the window around it                           <- run this one
 ```
 
-Imports only ever go one way: `schema <- data <- grid <- app`.
+Imports only ever go one way: `schema <- data <- {sqlview, grid} <- app`.
 
 | file | holds |
 | --- | --- |
 | `schema.py` | the A-E models (your repo's stand-in), `TableSpec`/`ColumnSpec` introspection, text<->value conversion, the dimension `Lookups`, the engine helper, and the demo seeder with its CLI |
 | `data.py` | `Row`/`RowState`, Excel-style filters, the validator, the `ChangeSet` payload, and `Repository` (load rows and lookups, apply a changeset). **Start here** -- its docstring is the API |
 | `grid.py` | the colours, `StagedTableModel` (staging + stored rows, sorting, filtering, deletion marks), the three undo commands, the per-type cell editors, the filter header, the gutter, and `GridView` (clipboard, fill, shortcuts, context menu) |
+| `sqlview.py` | `SqlView`: the same sort, filters and search as one SQL statement, for read-only mode. No Qt |
 | `app.py` | `FilterDialog`, `MainWindow`, the sink, the theme, and `main()` |
 
-`schema.py` and `data.py` import no Qt, which is what lets the tests cover the
-logic without a screen.
+`schema.py`, `data.py` and `sqlview.py` import no Qt, which is what lets the
+tests cover the logic without a screen.
 
 ## Pointing it at your real models
 
@@ -181,13 +186,17 @@ name too, and the value written back to the database is the member itself.
 ## How the grid behaves
 
 ```
-+---------------------------------------------+
-| staged insert rows   (green, key editable)  |  <- validated against the UC
-| the always-blank row (type or paste here)   |
-|=============================================|  <- green rule
-| rows from the database                      |  <- key greyed, data editable
-+---------------------------------------------+
+ +    | new-data area, lighter grey -- type or paste here
+ new  | a new row that passes validation          (green)
+ !!!  | a new row that does not                   (yellow, key outlined)
+======|========================================== <- green rule
+ 1234 | rows already in the database              (grey)
 ```
+
+The two halves are told apart by grey alone, so colour is free to mean
+something: **green** accepted, **yellow** needs attention, **blue** edited,
+**red** deleted. Selecting cells tints them grey rather than recolouring
+them, so a selected row still shows its state.
 
 * **Staging area.** The blank row sits directly above the stored rows. Touch
   any cell of it and a fresh blank row appears below; paste 20 rows into it
@@ -203,7 +212,10 @@ name too, and the value written back to the database is the member itself.
   the top, so a filter can't hide work in progress.
 * **Validation.** Staged rows are checked against the database's natural keys
   and against each other: duplicates, unknown drop-down values, missing
-  required fields. Bad cells get a red border and the reason in the tooltip;
+  required fields. A row that does not pass turns yellow all the way across,
+  its gutter reads `!!!`, and the natural key is outlined as a single block
+  rather than a box per cell; hover any cell for the reason. A row that does
+  pass turns green.
   Commit is disabled until they are clean. If a staged row collides with a
   row you deleted in the same session, that is a *warning* ("replaces #123"),
   not an error. Before anything is written, the changeset is replayed inside
@@ -221,6 +233,12 @@ name too, and the value written back to the database is the member itself.
   funnel in the header turns blue when a filter is live; `jsonb` is excluded.
 * **Sorting**: click a header; Ctrl+click adds a second/third level (the
   arrow shows the level number). Blanks always sort last.
+* **Only the newest version is loaded.** If a natural-key foreign key points
+  at a dimension whose label column is called `version` (or `revision`), the
+  query is restricted to its newest value -- by natural sort, so `2026.10`
+  beats `2026.2`. Older rows are never fetched, rather than fetched and
+  filtered out. `Repository.load_rows(latest_version_only=False)` gets
+  everything, and `repo.latest_version()` tells you which one is in force.
 
 ### Keyboard
 
@@ -239,6 +257,173 @@ name too, and the value written back to the database is the member itself.
 | `Ctrl+F` | the search box (matches any column) |
 | `F1` | the shortcut list; *Help > Colour legend* explains the colours |
 | click / right-click an id | select the row / delete, revert or restore it |
+
+## Loading
+
+The grid does not page. It fetches the first chunk, paints the window, and
+then keeps pulling the rest in the background until the whole version is in
+memory -- one chunk per turn of the event loop, so you can scroll, type and
+search while it arrives. *Data > Load in chunks of* offers 500 / 1,000 /
+2,500 / 5,000 / 10,000 rows, or everything in one query.
+
+**This is the difference that matters: once loading finishes, sorting,
+filtering and searching cover every row.** With real pagination they only ever
+cover the page you are on, which is quietly wrong rather than merely
+incomplete -- sort a page descending and the top row looks like the maximum
+when it is only the page's maximum. While chunks are still arriving the status
+bar says `(still loading - covers the rows fetched so far)`, and stops saying
+it when the last chunk lands.
+
+Measured on Python 3.10 / PySide6 6.4.1 against a 10,000-row version:
+
+| chunk | window appears | everything loaded |
+| --- | --- | --- |
+| 500 | 341 ms | 2,248 ms |
+| 1,000 | 358 ms | 1,241 ms |
+| **2,500 (default)** | **461 ms** | **676 ms** |
+| everything at once | 652 ms | 652 ms |
+
+Each chunk costs a fixed round trip of roughly 60 ms whatever its size, so
+small chunks buy about a hundred milliseconds of first paint and pay for it
+several times over in total time and in the number of brief pauses. 2,500 is
+the balance: the window is up in under half a second and the table is complete
+in under a second, in four queries rather than twenty.
+
+Change the default with `DEFAULT_CHUNK_SIZE` at the top of `app.py`, or
+per-run with `--limit`.
+
+Memory ends up where loading everything would -- about 53 MB of rows at
+10,000, on top of a fixed ~93 MB per instance. Chunking buys responsiveness,
+not footprint. Capping footprint means doing the sorting, filtering and
+searching in SQL instead, which is what the next section is about.
+
+## Doing the work in SQL instead
+
+`sqlview.py` is the other half of that trade. It turns the same `FilterSet`,
+sort order and search text into one statement, so only the rows on screen ever
+come back. This is what **read-only mode** (`--read-only`) runs on, and what
+lets the grid open a table far larger than it could hold.
+
+The translation has to *mean* the same thing as the Python version or the two
+modes would disagree about what a filter is, so it follows the same rules the
+grid does: a foreign key sorts and filters by its **label**, which means
+joining the dimension; an enum sorts in **declaration order**, which means a
+CASE; blanks sort **last** whichever way the column is sorted; and ties break
+on the primary key, because Python's sort is stable and the rows arrive by id.
+Getting those four right took the count of disagreeing views from 7 of 18 to
+**0 of 18** -- the test
+`test_the_database_view_agrees_with_the_in_memory_one` holds it there, row for
+row and position for position, over thirteen views.
+
+### What it costs and what it buys
+
+Measured on Python 3.10 / PySide6 6.4.1, 10,000 rows in one version, with the
+SQL side fetching a 200-row window plus its total -- what it takes to paint a
+screen:
+
+| | in memory | in SQL | |
+| --- | --- | --- | --- |
+| first paint | 289 ms | **7 ms** | 40x |
+| rows held | 10,000 | **200** | |
+| memory for rows | 33 MB | **~0 MB** | |
+| sort by a foreign key label | 43.6 ms | **22.9 ms** | 2x |
+| sort by a float, descending | 36.8 ms | **16.3 ms** | 2x |
+| sort by three columns | 141.1 ms | **26.2 ms** | 5x |
+| filter: value checklist | 23.7 ms | **12.1 ms** | 2x |
+| filter: numeric condition | 24.4 ms | **11.3 ms** | 2x |
+| quick search | **8.8 ms** | 164.5 ms | 19x |
+| filtered + searched + sorted | **18.7 ms** | 50.8 ms | 3x |
+
+SQL wins everything except search, and wins it by more the more work the view
+asks for: a three-column sort is 5x faster there because Postgres sorts 10,000
+rows in C while Python builds 10,000 key tuples.
+
+Search is the exception, and badly. The quick-search box has to look in every
+column, which in SQL is twenty `ILIKE` casts with no index behind them:
+
+| searched | cost |
+| --- | --- |
+| all 20 columns | 80.1 ms |
+| the 5 string columns | 21.8 ms |
+| one column | 6.0 ms |
+| the bare count | 1.2 ms |
+
+In memory the same search is 8.8 ms because `Row.search_text` caches each
+row's folded text, so a keystroke is 10,000 substring checks over strings that
+already exist. The cost in SQL is linear in columns scanned, so if search ever
+needs to be fast there, the fix is a `tsvector` column or scanning fewer
+columns -- not a better query.
+
+### So which mode gets used
+
+| | editing (model E) | read-only (any model) |
+| --- | --- | --- |
+| holds | the whole version | a capped window |
+| sort / filter / search | Python, over every row | SQL, over every row |
+| footprint at 10,000 rows | ~33 MB of rows | ~24 MB total |
+| staging, validation, undo, commit | yes | no |
+
+Editing mode stays in memory deliberately. Validation has to know whether a
+typed key already exists anywhere in the version, pending rows have to sort and
+filter alongside stored ones, and undo has to reach rows that are not on
+screen -- all of which need the rows to be *there*. Read-only mode has none of
+those obligations, so it can afford to hold almost nothing.
+
+If a filter has no SQL equivalent -- `matches regex` is the only one -- the
+grid falls back to filtering the rows it holds and says so in the status bar,
+naming the operator and the row count it actually covered. A partial answer
+labelled as partial is fine; a partial answer that looks whole is not.
+
+### Could editing mode go SQL-side too
+
+Yes, and here is the number that says so. The reason editing mode holds every
+row is validation: it has to know whether a typed key already exists anywhere
+in the version. But it does not need whole rows for that -- it needs the five
+unique-constraint columns:
+
+| held, at 10,000 rows | |
+| --- | --- |
+| whole rows (what it holds today) | 35.1 MB, 240 ms |
+| the key tuples only | **1.0 MB**, 46 ms |
+| the keys as display text | **0.6 MB**, 59 ms |
+
+Keys are **3%** of what rows cost; at 100,000 rows that is 10 MB of keys
+against 351 MB of rows. So a windowed editing mode is affordable, and what is
+left to build is the merge, not the index: pending inserts have to be sorted
+into a SQL result they are not in, rows with pending edits have to be excluded
+from the query and merged back in Python (their new values decide whether they
+match the filter and where they sort), and deleted rows have to keep their
+position so the red gutter stays put.
+
+That is a real piece of work rather than a flag, so it is not built. What is
+built is the half that proves it would behave: the translation, and the test
+that holds it to the in-memory meaning.
+
+## Read-only mode, on any model
+
+```bash
+python app.py --read-only --model yourrepo.models:Invoice
+```
+
+The grid's machinery -- sorting, the filter header, the filter dialog, quick
+search, copy, fill, the gutter, the theme -- works on any SQLAlchemy
+declarative model, because all of it is driven by `TableSpec` introspection
+rather than by anything specific to model E. Point it at a model with no
+unique constraint, no foreign keys and no enum and it opens anyway: there is
+simply nothing to stage against, so the staging row, the commit button, the
+add-row action and the editing chrome are not there.
+
+Verified against three unrelated tables, none of which has a natural key:
+
+```
+ModelA   table=model_a   rows=16   cols=['Name']
+ModelD   table=model_d   rows=5    cols=['Version']
+Updates  table=updates   rows=1    cols=['Name', 'D version', 'Changes', 'Modified At']
+```
+
+What model E keeps to itself is the editing side: staging, the dropdowns on
+the key columns, validation, the deletion marks, undo, and commit to
+`Updates`.
 
 ## Getting at the changes
 
@@ -343,8 +528,35 @@ Qt reads `#RRGGBBAA` as `#AARRGGBB`.
   one bulk operation, and there the cost is producing the display text, which
   pandas cannot help with -- its `to_csv` is slower than the `csv` module on
   the same strings.
-* Rows are loaded eagerly into memory (400 rows here; fine into the tens of
-  thousands). Past that, `Repository.load_rows` is the one function to swap
-  for a paged or threaded load.
+* Rows are loaded eagerly into memory. Measured on Python 3.10 / PySide6
+  6.4.1 with **10,000 rows in one version** -- roughly 42 MB, and:
+
+  | | |
+  | --- | --- |
+  | keystroke in the staging row | 12 ms |
+  | validate every row | 8 ms |
+  | quick search | 16 ms (the first one builds a cache: ~280 ms) |
+  | apply a filter / sort a column | 41 / 37 ms |
+  | repaint the viewport | 86 ms, and independent of row count |
+  | select all + copy the table | 363 ms |
+  | window startup | 464 ms |
+
+  Everything in the typing path stays far under what anyone notices; the
+  slower entries are one-off or bulk actions. The quick search keeps a folded
+  copy of each row's searchable text (`Row.search_text`), built on demand and
+  dropped whenever a value changes -- without it, each search re-rendered
+  every cell of every row and took 253 ms at this size.
+* Editing mode holds every row; read-only mode holds a window and pushes the
+  work into SQL. The split is not laziness about the editing side: validation
+  has to know whether a typed key exists anywhere in the version, staged rows
+  have to sort and filter alongside stored ones, and undo has to reach rows
+  that are off screen. The measurements and the trade are in *Doing the work
+  in SQL instead* above.
+* The SQL translation is held to the in-memory one by test, not by eye.
+  `test_the_database_view_agrees_with_the_in_memory_one` runs thirteen views
+  both ways and compares the primary keys **in order**; the four rules that
+  make them agree (label ordering for foreign keys, declaration order for
+  enums, blanks last, primary-key tie-break) are each there because that test
+  caught them missing.
 * Nothing checks whether a row changed underneath you between load and
   commit -- that is handled upstream by the API this feeds.

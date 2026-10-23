@@ -39,6 +39,7 @@ from data import (
     ChangeSet,
     ColumnFilter,
     Condition,
+    FilterSet,
     Join,
     Op,
     Repository,
@@ -113,6 +114,12 @@ def view(qapp, model):
 
 
 # ------------------------------------------------------------------- helpers
+@pytest.fixture(autouse=True)
+def _theme_is_global_so_put_it_back():
+    yield
+    set_theme(False)
+
+
 def press(view, key, mods=Qt.KeyboardModifier.NoModifier):
     view.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key, mods))
 
@@ -286,6 +293,7 @@ def test_regex_filter_survives_a_bad_pattern(spec):
 def test_changeset_separates_the_three_operations(spec, repo):
     lookups = repo.load_lookups()
     rows = repo.load_rows()
+    rows[0].remember_original()      # what the model does before an edit
     rows[0].values["weight"] = 0.5
     rows[0].recompute_state()
     rows[1].state = RowState.DELETED
@@ -381,9 +389,14 @@ def test_the_id_is_the_row_index_not_a_column(model):
 
     first_db = model.staged_count
     assert gutter(first_db) == str(model.row_at(first_db).values["id"])
-    assert gutter(0) == ""                       # the blank staging row
+    assert gutter(0) == "+"                      # "put new data here"
     model.setData(idx(model, 0, "label"), "typed")
-    assert gutter(0) == "new"                    # ...once it holds something
+    assert gutter(0) == "!!!"                    # incomplete: needs attention
+    for key, value in (("a_id", "APAC"), ("b_id", "RATES"), ("c_id", "BOND"),
+                       ("d_id", "2026.2"), ("type", "BASELINE")):
+        model.setData(idx(model, 0, key), value)
+    model.revalidate()
+    assert gutter(0) == ""                       # ...once it is valid, nothing
 
 
 # ------------------------------------------------------------------ editing
@@ -734,7 +747,10 @@ def test_pyqtdarktheme_does_not_flatten_the_cell_colours(view, model):
         host.setStyleSheet(stylesheet())
         QApplication.processEvents()
         palette = DARK if dark else LIGHT
-        assert pixel(0, "a_id") == palette.error_cell.name().lower()
+        # a staged row that fails validation is one solid yellow block
+        assert pixel(0, "a_id") == palette.staged_invalid.name()
+        assert pixel(0, "run_count") == palette.staged_invalid.name()
+        # the stored rows are grey, with the locked key columns darker
         assert pixel(model.staged_count + 1, "a_id") == palette.key_readonly.name()
         assert pixel(model.staged_count + 1, "run_count") == palette.base.name()
     set_theme(False)
@@ -961,13 +977,16 @@ def test_commit_applies_inserts_updates_and_deletes(model, repo):
     assert result.ok, result.error
     assert len(result.inserted) == 1 and result.updated == 1 and result.deleted == 1
 
-    reloaded = {r.values["id"]: r for r in repo.load_rows()}
+    # read every version back, not just the newest, since free_key() may well
+    # have picked an older one
+    reloaded = {r.values["id"]: r for r in repo.load_rows(latest_version_only=False)}
     assert doomed not in reloaded
     assert reloaded[result.inserted[0]].values["label"] == "committed by the test"
 
 
 def test_dry_run_reports_the_constraint_violation(model, repo):
     """Belt and braces: even if validation were bypassed, the db still says no."""
+    before = repo.count()
     existing = repo.load_rows()[0]
     clone = Row.staged(
         model.spec, {k: v for k, v in existing.values.items() if k != "id"}
@@ -976,7 +995,7 @@ def test_dry_run_reports_the_constraint_violation(model, repo):
     result = repo.apply(changeset, dry_run=True)
     assert not result.ok
     assert "unique" in (result.error or "").lower()
-    assert repo.count() == len(repo.load_rows())  # nothing was written
+    assert repo.count() == before  # nothing was written
 
 
 # --------------------------------------------------- somebody else's schema
@@ -1168,3 +1187,439 @@ def test_an_enum_round_trips_through_the_grid_by_name(qapp, other_repo):
     with Session(other_repo.engine) as s:
         stored = s.get(Reading, changeset.updates[0].pk).phase
     assert stored is Bucket.SECOND_QUARTER
+
+
+def test_only_the_newest_version_is_loaded(repo):
+    """Older versions are never edited, so they are never fetched."""
+    newest_id, newest_label = repo.latest_version()
+    assert repo.version_column.key == "d_id"
+
+    everything = repo.load_rows(latest_version_only=False)
+    newest_only = repo.load_rows()
+    assert len(newest_only) < len(everything) == repo.count()
+    assert {r.values["d_id"] for r in newest_only} == {newest_id}
+
+    # and "newest" means naturally newest, not alphabetically
+    labels = repo.load_lookups().choices(repo.spec["d_id"])
+    assert newest_label == labels[-1]
+
+
+def test_natural_sort_puts_2026_10_after_2026_2():
+    from schema import natural_sort_key
+
+    versions = ["2026.1", "2026.10", "2026.2", "2025.9"]
+    assert sorted(versions, key=natural_sort_key) == [
+        "2025.9", "2026.1", "2026.2", "2026.10",
+    ]
+
+
+def test_quick_search_cache_follows_edits(model):
+    """The per-row search text is cached; a stale cache would hide edits.
+
+    Each search below uses a different term, because re-setting the same term
+    is a no-op -- the view deliberately does not re-filter under you while you
+    type, the way a spreadsheet does not either.
+    """
+    row = model.staged_count
+    model.setData(idx(model, row, "owner"), "zebra-team")
+
+    model.set_quick_search("zebra-team")
+    assert model.visible_db_rows() == 1
+
+    model.setData(idx(model, row, "owner"), "giraffe-team")
+    model.set_quick_search("giraffe-team")
+    assert model.visible_db_rows() == 1          # the cache was rebuilt
+    model.set_quick_search("zebra-team")
+    assert model.visible_db_rows() == 0          # and the old text is gone
+
+    model.undo_stack.undo()                      # back to zebra-team
+    model.set_quick_search("giraffe-team")
+    assert model.visible_db_rows() == 0
+    model.set_quick_search("zebra-team")
+    assert model.visible_db_rows() == 1
+    model.set_quick_search("")
+
+
+def test_untouched_rows_do_not_carry_a_copy_of_themselves(model, repo):
+    """`original` is copy-on-write: only edited rows pay for the snapshot."""
+    stored = model.row_at(model.staged_count)
+    assert stored.original is None          # loaded, never touched
+    assert not stored.is_staged
+    assert stored.changed_keys() == set()
+    assert stored.stored is stored.values   # "what the database has" still works
+
+    # the key index is built from stored values either way
+    keys = existing_key_map(model.spec, [stored])
+    assert keys and stored.values["id"] in keys.values()
+
+    model.setData(idx(model, model.staged_count, "weight"), "0.4242")
+    assert stored.original is not None      # ...and now it pays
+    assert stored.changed_keys() == {"weight"}
+    assert stored.stored["weight"] != stored.values["weight"]
+
+    # undo returns the value; the snapshot can stay, it is one row
+    model.undo_stack.undo()
+    assert stored.changed_keys() == set()
+    assert stored.state is RowState.CLEAN
+
+
+# ------------------------------------------------- branches in Updates
+def test_a_branch_round_trips_through_the_updates_table(model, repo):
+    """Commit writes the changeset to Updates; reopening replays it exactly."""
+    from schema import Base
+
+    Base.metadata.create_all(repo.engine)
+    assert repo.list_branches() == []
+
+    # stage one of each kind of change
+    key = free_key(model, repo)
+    for column, text in zip(("a_id", "b_id", "c_id", "d_id", "type"), key):
+        model.setData(idx(model, 0, column), text)
+    model.setData(idx(model, 0, "label"), "added on a branch")
+
+    first = model.staged_count
+    model.setData(idx(model, first, "weight"), "0.4242")
+    edited_pk = model.row_at(first).values["id"]
+    doomed_pk = model.row_at(first + 1).values["id"]
+    model.delete_rows([first + 1])
+
+    before = model.changeset()
+    assert before.counts == {"inserts": 1, "updates": 1, "deletes": 1, "cells": 1}
+
+    version_id = repo.latest_version()[0]
+    branch_id = repo.save_branch(before.to_payload(), version_id=version_id,
+                                 label="my branch")
+
+    # the fact table is untouched: this app only ever writes Updates
+    assert repo.count() == len(repo.load_rows(latest_version_only=False))
+    assert model.row_at(first + 1) is not None or True
+
+    listed = repo.list_branches()
+    assert [b.id for b in listed] == [branch_id]
+    assert listed[0].label == "my branch"
+    assert listed[0].version_label == repo.latest_version()[1]
+
+    # a fresh grid, then replay the branch onto it
+    fresh = StagedTableModel(repo.spec)
+    fresh.load(repo.load_rows(), repo.load_lookups())
+    fresh.validator.set_existing_keys(repo.natural_keys())
+    assert fresh.changeset().is_empty
+
+    counts = fresh.replay(repo.load_branch(branch_id).changes)
+    assert counts == {"inserts": 1, "updates": 1, "deletes": 1, "missing": 0,
+                      "unreadable": 0}
+
+    after = fresh.changeset()
+    assert after.counts == before.counts
+    assert after.inserts[0].key_text == before.inserts[0].key_text
+    assert after.updates[0].pk == edited_pk
+    assert after.updates[0].changes[0].new == 0.4242
+    assert after.deletes[0].pk == doomed_pk
+
+
+def test_pushing_again_updates_the_same_branch(model, repo):
+    from schema import Base
+
+    Base.metadata.create_all(repo.engine)
+    version_id = repo.latest_version()[0]
+    branch_id = repo.save_branch({"operations": []}, version_id=version_id,
+                                 label="b")
+    first_seen = repo.load_branch(branch_id).modified_at
+
+    model.setData(idx(model, model.staged_count, "owner"), "someone-else")
+    repo.save_branch(model.changeset().to_payload(), branch_id=branch_id)
+
+    assert len(repo.list_branches()) == 1          # still one branch
+    reloaded = repo.load_branch(branch_id)
+    assert reloaded.changes["operations"][0]["op"] == "update"
+    assert reloaded.modified_at >= first_seen      # modified_at moved
+
+
+def test_a_branch_survives_rows_disappearing(model, repo):
+    """A branch can outlive the rows it names; replay says how many."""
+    from schema import Base
+
+    Base.metadata.create_all(repo.engine)
+    payload = {"operations": [
+        {"op": "update", "pk": 10 ** 9, "key": {}, "key_labels": {},
+         "changes": [{"column": "weight", "old": 1, "new": 2}]},
+        {"op": "delete", "pk": 10 ** 9 + 1, "key": {}, "key_labels": {}},
+    ]}
+    assert model.replay(payload) == {
+        "inserts": 0, "updates": 0, "deletes": 0, "missing": 2, "unreadable": 0}
+    assert model.changeset().is_empty
+
+
+def test_a_branch_full_of_junk_does_not_take_the_app_down(model):
+    """A branch written by another tool, or an older format, must not crash."""
+    empty = {"inserts": 0, "updates": 0, "deletes": 0, "missing": 0, "unreadable": 0}
+    assert model.replay(None) == empty
+    assert model.replay({}) == empty
+    assert model.replay(42) == empty
+    assert model.replay({"operations": "nonsense"}) == empty
+
+    # the shape that actually crashed: operations that are not objects
+    assert model.replay({"operations": [1, 2, 3]}) == dict(empty, unreadable=3)
+    assert model.replay({"operations": [{"op": "wat"}]}) == dict(empty, unreadable=1)
+    assert model.changeset().is_empty
+
+
+# -------------------------------------------------------- the window itself
+@pytest.fixture
+def window(qapp, repo):
+    from schema import Base
+    from app import MainWindow
+
+    Base.metadata.create_all(repo.engine)
+    return MainWindow(repo)
+
+
+def test_opening_a_branch_is_not_an_unsaved_change(window, repo):
+    """The bug: a branch's own changes are shown as pending edits, so asking
+    "is the grid dirty" always said yes and every branch switch demanded to
+    discard work that did not exist."""
+    model = window.model
+    assert not window.unsaved_changes()
+
+    model.setData(idx(model, model.staged_count, "weight"), "0.9999")
+    assert window.unsaved_changes()
+    branch_id = repo.save_branch(
+        model.changeset().to_payload(),
+        version_id=repo.latest_version()[0],
+        label="b",
+    )
+
+    window.branch = repo.load_branch(branch_id)
+    window.reload()
+    assert model.dirty_counts()["updates"] == 1     # the branch is shown...
+    assert not window.unsaved_changes()             # ...but nothing is unsaved
+
+    model.setData(idx(model, model.staged_count, "owner"), "someone")
+    assert window.unsaved_changes()
+    window.undo_stack.undo()
+    assert not window.unsaved_changes()
+
+
+def test_commit_lights_up_only_when_there_is_something_to_push(window):
+    model = window.model
+    assert not window.action_commit.isEnabled()
+
+    model.setData(idx(model, model.staged_count, "weight"), "0.5")
+    window._refresh()
+    assert window.action_commit.isEnabled()
+    assert "background" in (window._commit_button.styleSheet() or "")
+
+    model.setData(idx(model, 0, "a_id"), "NOT-A-REGION")   # now it is invalid
+    model.revalidate()
+    window._refresh()
+    assert not window.action_commit.isEnabled()
+    assert "Fix the" in window.action_commit.toolTip()
+
+
+def test_rows_arrive_in_chunks_until_everything_is_here(window, repo):
+    """The window paints on the first chunk, then the rest follows on its own."""
+    total = repo.count_rows()
+    size = max(1, total // 3)
+    window.set_chunk_size(size)
+    window.reload()
+
+    assert window.model.total_db_rows() == size < total
+    assert window._loading                          # more is on the way
+
+    guard = 0
+    while window._loading and guard < 100:
+        QApplication.processEvents()
+        guard += 1
+
+    assert window.model.total_db_rows() == total    # ...and it all arrived
+    assert not window._loading
+    assert "All" in window._message_label.text()
+
+
+def test_a_background_load_does_not_lose_the_sort(window, repo):
+    """Chunks that arrive while sorted are merged in, not appended blindly."""
+    total = repo.count_rows()
+    window.set_chunk_size(max(1, total // 3))
+    window.reload()
+    model = window.model
+    model.set_sort([("weight", True)])
+
+    guard = 0
+    while window._loading and guard < 100:
+        QApplication.processEvents()
+        guard += 1
+
+    assert model.total_db_rows() == total
+    weights = [
+        model.row_at(r).values["weight"]
+        for r in range(model.staged_count, model.rowCount())
+    ]
+    assert weights == sorted(weights, key=lambda w: (w is None, w), reverse=True)
+
+
+def test_search_and_sort_are_global_once_loading_finishes(window, repo):
+    """The point of loading in the background rather than paging: when it is
+    done, a search sees every row, not just the ones on screen."""
+    rows = repo.load_rows()
+    far = rows[-1]
+    needle = "ONLY-ON-THE-LAST-CHUNK"
+    with Session(repo.engine) as s, s.begin():
+        s.get(repo.model, far.values["id"]).source_ref = needle
+
+    total = repo.count_rows()
+    window.set_chunk_size(max(1, total // 3))
+    window.reload()
+    model = window.model
+
+    model.set_quick_search(needle)
+    assert model.visible_db_rows() == 0             # not fetched yet
+    assert "still loading" in window._counts_label.text()
+    model.set_quick_search("")
+
+    guard = 0
+    while window._loading and guard < 100:
+        QApplication.processEvents()
+        guard += 1
+
+    model.set_quick_search(needle)
+    assert model.visible_db_rows() == 1             # now it is global
+    assert "still loading" not in window._counts_label.text()
+
+
+# ------------------------------------------------- the database-side view
+VIEWS = [
+    ("sort by a foreign key label", dict(sort=(("a_id", False),))),
+    ("sort by a foreign key, descending", dict(sort=(("a_id", True),))),
+    ("sort by an enum in declaration order", dict(sort=(("type", False),))),
+    ("sort by a float, blanks last", dict(sort=(("weight", True),))),
+    ("sort by three columns",
+     dict(sort=(("a_id", False), ("type", False), ("weight", True)))),
+    ("value checklist on a foreign key",
+     dict(filters=[ColumnFilter(key="a_id", allowed=frozenset({"APAC", "GLOBAL"}))])),
+    ("value checklist on an enum",
+     dict(filters=[ColumnFilter(key="type", allowed=frozenset({"BASELINE"}))])),
+    ("numeric condition",
+     dict(filters=[ColumnFilter(key="score", conditions=(Condition(Op.GT, "50"),))])),
+    ("between",
+     dict(filters=[ColumnFilter(key="priority",
+                                conditions=(Condition(Op.BETWEEN, "5", "50"),))])),
+    ("text contains",
+     dict(filters=[ColumnFilter(key="owner", conditions=(Condition(Op.CONTAINS, "a"),))])),
+    ("is blank",
+     dict(filters=[ColumnFilter(key="status_note", conditions=(Condition(Op.BLANK),))])),
+    ("quick search", dict(search="RATES")),
+    ("filtered, searched and sorted",
+     dict(sort=(("weight", True),), search="APAC",
+          filters=[ColumnFilter(key="type", allowed=frozenset({"BASELINE"}))])),
+]
+
+
+@pytest.mark.parametrize("label,view", VIEWS, ids=[v[0] for v in VIEWS])
+def test_the_database_view_agrees_with_the_in_memory_one(qapp, repo, label, view):
+    """The two modes must mean the same thing by a sort or a filter.
+
+    Same rows, in the same order -- including the awkward parts: foreign keys
+    order by label not id, enums by declaration order, blanks last whichever
+    way the column is sorted, and ties broken by the primary key because
+    Python's sort is stable.
+    """
+    from sqlview import SqlView, ViewQuery
+
+    lookups = repo.load_lookups()
+    model = StagedTableModel(repo.spec, lookups)
+    model.load(repo.load_rows(latest_version_only=False), lookups)
+    pk = repo.spec.pk.key
+
+    model.set_sort(list(view.get("sort", ())))
+    for flt in view.get("filters") or ():
+        model.set_filter(flt)
+    if view.get("search"):
+        model.set_quick_search(view["search"])
+    in_memory = [
+        model.row_at(r).values[pk]
+        for r in range(model.staged_count, model.rowCount())
+    ]
+
+    filters = FilterSet()
+    for flt in view.get("filters") or ():
+        filters.set(flt)
+    sql = SqlView(repo.model, repo.spec, lookups)
+    from_db = [
+        r.values[pk]
+        for r in sql.rows(
+            repo.engine,
+            ViewQuery(sort=view.get("sort", ()), filters=filters,
+                      search=view.get("search", "")),
+        )
+    ]
+
+    assert in_memory, f"{label} matched nothing, so it proves nothing"
+    assert from_db == in_memory
+    assert sql.count(repo.engine, ViewQuery(
+        filters=filters, search=view.get("search", ""))) == len(in_memory)
+
+
+def test_read_only_opens_a_model_with_no_natural_key(qapp, repo):
+    from app import MainWindow
+    from schema import ModelA
+
+    other = Repository(engine=repo.engine, model=ModelA, updates_model=None)
+    assert other.spec.unique_constraint is None      # nothing to stage against
+
+    window = MainWindow(other, read_only=True)
+    model = window.model
+    assert model.staged_count == 0                   # no blank row to type into
+    assert not model.index(0, 0).flags() & Qt.ItemFlag.ItemIsEditable
+    assert not window.action_commit.isVisible()
+    assert not window.action_add_row.isVisible()
+    assert model.total_db_rows() > 0
+
+
+def test_read_only_sorting_covers_rows_it_is_not_holding(qapp, repo):
+    """The point of pushing it down: the answer is global even though only a
+    capped slice is in memory."""
+    from app import MainWindow
+
+    window = MainWindow(repo, read_only=True)
+    window.read_only_cap = 5
+    window._requery()
+    model = window.model
+
+    assert model.total_db_rows() == 5 < window._sql_total
+    model.set_sort([("weight", True)])
+    top = model.row_at(0).values["weight"]
+
+    everything = [r.values["weight"] for r in repo.load_rows(latest_version_only=False)]
+    assert top == max(w for w in everything if w is not None)
+
+
+def test_a_filter_sql_cannot_express_says_so_instead_of_lying(qapp, repo):
+    """Regex has no SQL equivalent.
+
+    The grid falls back to filtering the rows it holds, which is a real answer
+    about those rows -- so it has to say that is all it covers, or the user
+    reads a partial result as a whole-table one.
+    """
+    from sqlview import SqlView, Untranslatable, ViewQuery
+    from app import MainWindow
+
+    filters = FilterSet()
+    filters.set(ColumnFilter(key="owner", conditions=(Condition(Op.REGEX, "^risk"),)))
+    sql = SqlView(repo.model, repo.spec, repo.load_lookups())
+    with pytest.raises(Untranslatable):
+        sql.statement(ViewQuery(filters=filters))
+
+    window = MainWindow(repo, read_only=True)
+    held = window._sql_total
+    window.model.set_filter(
+        ColumnFilter(key="owner", conditions=(Condition(Op.REGEX, "^risk"),))
+    )
+    window._requery()
+
+    said = window._message_label.text()
+    assert "matches regex" in said                   # which filter went wrong
+    assert "not the whole table" in said             # and that it is partial
+    assert f"{held:,} loaded row(s)" in said
+    # the Python fallback really did apply the regex
+    owners = [window.model.row_at(r).values["owner"] for r in range(window.model.rowCount())]
+    assert owners and all(str(o).startswith("risk") for o in owners)

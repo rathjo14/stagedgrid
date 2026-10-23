@@ -35,13 +35,16 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, null, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from schema import (
     LABEL_COLUMNS,
+    Updates,
+    UpdatesSpec,
+    natural_sort_key,
     ColumnKind,
     ColumnSpec,
     Lookups,
@@ -69,7 +72,14 @@ class RowState(enum.Enum):
 
 @dataclass
 class Row:
-    """One grid row: ``values`` is live, ``original`` is what the database had."""
+    """One grid row.
+
+    ``values`` is live. ``original`` is what the database had, and is only
+    taken on the first edit -- a table of ten thousand untouched rows should
+    not carry ten thousand copies of itself. Anything that writes to
+    ``values`` on a stored row must call :meth:`remember_original` first, or
+    the edit will not be seen as a change; the model does this for you.
+    """
 
     values: dict[str, Any]
     original: Optional[dict[str, Any]] = None
@@ -77,21 +87,41 @@ class Row:
     uid: int = field(default_factory=lambda: next(_uid_counter))
     errors: dict[str, str] = field(default_factory=dict)
     warnings: dict[str, str] = field(default_factory=dict)
+    is_new: bool = False
+    search_text: Optional[str] = field(default=None, repr=False, compare=False)
+    """Every searchable cell of this row, folded and joined.
+
+    The quick-search box would otherwise re-render every cell of every row on
+    each keystroke. Built on demand by the model and dropped whenever a value
+    changes.
+    """
 
     @classmethod
     def from_db(cls, values: dict[str, Any]) -> "Row":
-        return cls(values=dict(values), original=dict(values), state=RowState.CLEAN)
+        # No copy of the values yet: `original` is taken on the first edit, so
+        # the thousands of rows nobody touches cost one dict, not two.
+        return cls(values=dict(values), original=None, state=RowState.CLEAN)
 
     @classmethod
     def staged(cls, spec: TableSpec, values: Optional[dict[str, Any]] = None) -> "Row":
         blank = {c.key: None for c in spec.columns}
         if values:
             blank.update(values)
-        return cls(values=blank, original=None, state=RowState.NEW)
+        return cls(values=blank, original=None, state=RowState.NEW, is_new=True)
+
+    def remember_original(self) -> None:
+        """Snapshot the stored values. Call before changing a stored row."""
+        if self.original is None and not self.is_new:
+            self.original = dict(self.values)
+
+    @property
+    def stored(self) -> dict[str, Any]:
+        """What the database holds: the snapshot if there is one, else now."""
+        return self.values if self.original is None else self.original
 
     @property
     def is_staged(self) -> bool:
-        return self.original is None
+        return self.is_new
 
     def pk(self, spec: TableSpec) -> Optional[int]:
         return self.values.get(spec.pk.key)
@@ -106,12 +136,14 @@ class Row:
         )
 
     def changed_keys(self) -> set[str]:
-        if self.original is None:
+        if self.is_new:
             return {k for k, v in self.values.items() if not is_blank(v)}
+        if self.original is None:
+            return set()            # never edited, so nothing can have changed
         return {k for k, v in self.values.items() if not _same(v, self.original.get(k))}
 
     def is_cell_changed(self, key: str) -> bool:
-        if self.original is None:
+        if self.is_new or self.original is None:
             return False
         return not _same(self.values.get(key), self.original.get(key))
 
@@ -523,10 +555,11 @@ def existing_key_map(spec: TableSpec, rows: Iterable[Row]) -> dict[tuple, int]:
     """Natural key -> pk for the rows loaded from the database."""
     out: dict[tuple, int] = {}
     for row in rows:
-        if row.original is None:
+        if row.is_new:
             continue
-        key = _normalise(tuple(row.original.get(c.key) for c in spec.key_columns))
-        pk = row.original.get(spec.pk.key)
+        stored = row.stored
+        key = _normalise(tuple(stored.get(c.key) for c in spec.key_columns))
+        pk = stored.get(spec.pk.key)
         if pk is not None:
             out[key] = pk
     return out
@@ -794,6 +827,22 @@ class ApplyResult:
         )
 
 
+@dataclass
+class Branch:
+    """One row of the Updates table: a set of staged changes against a version."""
+
+    id: int
+    label: str
+    version_id: Optional[int]
+    version_label: str
+    modified_at: Optional[dt.datetime]
+    changes: Optional[dict] = None   # only loaded when the branch is opened
+
+    def summary(self) -> str:
+        when = self.modified_at.strftime("%Y-%m-%d %H:%M") if self.modified_at else "-"
+        return f"{self.label or f'#{self.id}'}  ({self.version_label}, {when})"
+
+
 class Repository:
     """Loads rows and lookups, and applies a changeset in one transaction."""
 
@@ -802,6 +851,7 @@ class Repository:
         engine: Optional[Engine] = None,
         model: type = ModelE,
         label_columns: Optional[dict[str, str]] = None,
+        updates_model: Optional[type] = Updates,
     ) -> None:
         self.engine = engine or make_engine()
         self.model = model
@@ -810,6 +860,107 @@ class Repository:
             # models, let the introspection work the label columns out.
             label_columns = LABEL_COLUMNS if model is ModelE else {}
         self.spec = TableSpec.from_mapped_class(model, label_columns)
+        version = self.version_column
+        self.updates: Optional[UpdatesSpec] = (
+            UpdatesSpec.from_mapped_class(
+                updates_model,
+                version_table=version.fk.target_table if version else None,
+            )
+            if updates_model is not None
+            else None
+        )
+
+    # -- the Updates table: one row per branch of staged changes ----------
+    def _version_label(self, session, version_id: Optional[int]) -> str:
+        col = self.version_column
+        if col is None or version_id is None:
+            return ""
+        target = col.fk.target_class
+        found = session.execute(
+            select(getattr(target, col.fk.label_attr)).where(
+                getattr(target, col.fk.target_pk_attr) == version_id
+            )
+        ).scalar()
+        return str(found or "")
+
+    def list_branches(self) -> list[Branch]:
+        """Every branch, newest first. The json is left behind until opened."""
+        if self.updates is None:
+            return []
+        u = self.updates
+        model = u.model
+        wanted = [getattr(model, u.pk)]
+        for attr in (u.label, u.version, u.modified_at):
+            wanted.append(getattr(model, attr) if attr else null())
+        out = []
+        with Session(self.engine) as s:
+            for pk, label, version_id, modified in s.execute(select(*wanted)):
+                out.append(
+                    Branch(
+                        id=pk,
+                        label=str(label or ""),
+                        version_id=version_id,
+                        version_label=self._version_label(s, version_id),
+                        modified_at=modified,
+                    )
+                )
+        out.sort(key=lambda b: (b.modified_at is None, b.modified_at), reverse=True)
+        return out
+
+    def load_branch(self, branch_id: int) -> Optional[Branch]:
+        """One branch, with its changes."""
+        if self.updates is None:
+            return None
+        u = self.updates
+        model = u.model
+        with Session(self.engine) as s:
+            row = s.get(model, branch_id)
+            if row is None:
+                return None
+            version_id = getattr(row, u.version) if u.version else None
+            return Branch(
+                id=getattr(row, u.pk),
+                label=str(getattr(row, u.label) or "") if u.label else "",
+                version_id=version_id,
+                version_label=self._version_label(s, version_id),
+                modified_at=getattr(row, u.modified_at) if u.modified_at else None,
+                changes=getattr(row, u.changes) or {},
+            )
+
+    def save_branch(
+        self,
+        payload: dict,
+        version_id: Optional[int] = None,
+        branch_id: Optional[int] = None,
+        label: Optional[str] = None,
+    ) -> int:
+        """Write the changes to a branch, creating one if needed.
+
+        This is the only thing Commit does: the fact table itself is never
+        written here -- applying a branch is somebody else's job.
+        """
+        if self.updates is None:
+            raise ValueError("no Updates table is configured")
+        u = self.updates
+        values: dict[str, Any] = {u.changes: payload}
+        if u.version and version_id is not None:
+            values[u.version] = version_id
+        if u.label and label is not None:
+            values[u.label] = label
+        with Session(self.engine) as s, s.begin():
+            if branch_id is None:
+                row = u.model(**values)
+                s.add(row)
+                s.flush()
+                return getattr(row, u.pk)
+            if u.modified_at:
+                values[u.modified_at] = dt.datetime.now(dt.timezone.utc)
+            s.execute(
+                update(u.model)
+                .where(getattr(u.model, u.pk) == branch_id)
+                .values(**values)
+            )
+            return branch_id
 
     def load_lookups(self) -> Lookups:
         lookups = Lookups()
@@ -825,14 +976,62 @@ class Repository:
                 lookups.register(col, pairs)
         return lookups
 
-    def load_rows(self, limit: Optional[int] = None) -> list[Row]:
+    @property
+    def version_column(self) -> Optional[ColumnSpec]:
+        """The natural-key foreign key pointing at a version dimension."""
+        for col in self.spec.key_columns:
+            if col.fk is not None and col.fk.label_attr in ("version", "revision"):
+                return col
+        return None
+
+    def latest_version(self) -> Optional[tuple[int, str]]:
+        """(id, label) of the newest value in the version dimension."""
+        col = self.version_column
+        if col is None:
+            return None
+        target = col.fk.target_class
+        with Session(self.engine) as s:
+            pairs = s.execute(
+                select(
+                    getattr(target, col.fk.target_pk_attr),
+                    getattr(target, col.fk.label_attr),
+                )
+            ).all()
+        if not pairs:
+            return None
+        pk, label = max(pairs, key=lambda pair: natural_sort_key(str(pair[1])))
+        return int(pk), str(label)
+
+    def load_rows(
+        self,
+        limit: Optional[int] = None,
+        latest_version_only: bool = True,
+        version_id: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> list[Row]:
+        """Rows for the grid.
+
+        Only the newest version is loaded by default: older ones are never
+        edited, so there is no reason to carry them around or filter them out
+        afterwards. Pass ``version_id`` to open a different one, which is what
+        opening a branch does.
+        """
         keys = [c.key for c in self.spec.columns]
         enum_keys = {c.key for c in self.spec.columns if c.kind is ColumnKind.ENUM}
         stmt = select(*(getattr(self.model, k) for k in keys)).order_by(
             getattr(self.model, self.spec.pk.key)
         )
+        version = self.version_column
+        if version is not None:
+            if version_id is None and latest_version_only:
+                newest = self.latest_version()
+                version_id = newest[0] if newest else None
+            if version_id is not None:
+                stmt = stmt.where(getattr(self.model, version.key) == version_id)
         if limit:
             stmt = stmt.limit(limit)
+        if offset:
+            stmt = stmt.offset(offset)
 
         rows: list[Row] = []
         with Session(self.engine) as s:
@@ -868,6 +1067,21 @@ class Repository:
                 return getattr(row, col.fk.target_pk_attr)
         except SQLAlchemyError as exc:
             raise ValueError(_clean_error(exc)) from exc
+
+    def count_rows(
+        self, latest_version_only: bool = True, version_id: Optional[int] = None
+    ) -> int:
+        """How many rows the grid would load without a page limit."""
+        stmt = select(func.count()).select_from(self.model)
+        version = self.version_column
+        if version is not None:
+            if version_id is None and latest_version_only:
+                newest = self.latest_version()
+                version_id = newest[0] if newest else None
+            if version_id is not None:
+                stmt = stmt.where(getattr(self.model, version.key) == version_id)
+        with Session(self.engine) as s:
+            return int(s.execute(stmt).scalar_one())
 
     def natural_keys(self) -> dict[tuple, int]:
         """Natural key -> pk straight from the database."""

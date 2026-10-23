@@ -92,8 +92,12 @@ class Palette:
     selection: QColor       # includes alpha
     updated_row: QColor     # faint: row has pending edits
     updated_cell: QColor    # stronger: this cell is one of them
-    staged_row: QColor      # staged insert
+    staged_row: QColor      # staged insert that passes validation
     staged_blank: QColor    # the always-present empty row
+    staged_invalid: QColor  # staged insert that does not pass yet
+    staged_invalid_edge: QColor
+    staged_mark: QColor     # the "+" on the empty row
+    attention: QColor       # the "!!!" on a row that needs looking at
     key_readonly: QColor    # natural-key cell on an existing row
     key_readonly_text: QColor
     error_cell: QColor
@@ -133,13 +137,19 @@ def _palette(**values) -> Palette:
 
 
 LIGHT = _palette(
-    base="#FFFFFF", text="#1E1E1E", grid_line="#DCDCDC",
+    # The stored rows are grey and the staging block above them is a lighter
+    # grey, so the two halves read apart at a glance without any colour.
+    # Colour then means something: green accepted, yellow needs attention,
+    # blue edited, red deleted.
+    base="#ECECEC", text="#1E1E1E", grid_line="#D4D4D4",
     # Excel tints the selection rather than colouring it, so the cell's own
     # state colour still reads through. Neutral grey, not an accent.
-    selection=(0, 0, 0, 28), focus_border="#3C3C3C",
-    updated_row="#E8F1FD", updated_cell="#BBD6FA",
-    staged_row="#EFFAF1", staged_blank="#F8FCF9",
-    key_readonly="#EFEFEF", key_readonly_text="#6B6B6B",
+    selection=(0, 0, 0, 34), focus_border="#3C3C3C",
+    updated_row="#DCE9FA", updated_cell="#B6D3F7",
+    staged_row="#DCF2E1", staged_blank="#F7F7F7",
+    staged_invalid="#FBEFC0", staged_invalid_edge="#B8860B",
+    staged_mark="#1F7A35", attention="#8A6100",
+    key_readonly="#DCDCDC", key_readonly_text="#5E5E5E",
     error_cell="#FBE3E5", error_border="#D1383D",
     warning_cell="#FDF3E2", warning_border="#C98416",
     deleted_mark="#D1383D", deleted_row="#F6C9CB", deleted_text="#7A3034",
@@ -151,11 +161,13 @@ LIGHT = _palette(
 )
 
 DARK = _palette(
-    base="#1E1E1E", text="#E4E4E4", grid_line="#343434",
-    selection=(255, 255, 255, 34), focus_border="#C9C9C9",
-    updated_row="#1C2C3F", updated_cell="#2F4C73",
-    staged_row="#15301E", staged_blank="#161E19",
-    key_readonly="#2A2A2A", key_readonly_text="#9B9B9B",
+    base="#2B2B2B", text="#E4E4E4", grid_line="#3C3C3C",
+    selection=(255, 255, 255, 38), focus_border="#C9C9C9",
+    updated_row="#23344A", updated_cell="#31567F",
+    staged_row="#20402B", staged_blank="#3A3A3A",
+    staged_invalid="#4A3E15", staged_invalid_edge="#D9A520",
+    staged_mark="#5FBF7A", attention="#E0B344",
+    key_readonly="#232323", key_readonly_text="#9B9B9B",
     error_cell="#3C1E22", error_border="#E06C75",
     warning_cell="#3A2D18", warning_border="#D6A14A",
     deleted_mark="#E06C75", deleted_row="#4A2126", deleted_text="#D79AA0",
@@ -186,6 +198,10 @@ def stylesheet() -> str:
     background brushes, which is where every row/cell state colour lives.
     """
     return """
+/* pyqtdarktheme paints selected cells with a blue overlay
+   (QAbstractItemView::item:selected). Neutralise it here so the cell keeps
+   its own state colour and GridDelegate's grey wash is what shows. */
+QTableView::item:selected { background: transparent; }
 QTableView {
     background: %(base)s;
     color: %(text)s;
@@ -242,18 +258,33 @@ class StagedTableModel(QAbstractTableModel):
     stateChanged = Signal()     # anything that can change the pending changeset
     message = Signal(str, bool)  # (text, is_error) -- shown in the status bar
 
+    viewChanged = Signal()
+    """The sort, filters or search changed.
+
+    In read-only mode the window listens to this and re-asks the database,
+    so ordering and filtering cover the whole table rather than whatever
+    happens to be loaded.
+    """
+
     def __init__(
         self,
         spec: TableSpec,
         lookups: Optional[Lookups] = None,
         undo_stack: Optional[QUndoStack] = None,
         parent=None,
+        read_only: bool = False,
     ) -> None:
         super().__init__(parent)
         self.spec = spec
+        #: Read-only grids have no staging row and no editable cells, which is
+        #: what lets any mapped class be opened, not just one with a natural key.
+        self.read_only = read_only
         #: The columns the grid shows: everything but the primary key, which
         #: is the row index in the gutter instead of a cell.
         self.columns = tuple(c for c in spec.columns if not c.is_pk)
+        #: First and last grid column of the natural key, for outlining it.
+        key_at = [i for i, c in enumerate(self.columns) if c.in_key]
+        self.key_span = (key_at[0], key_at[-1]) if key_at else (-1, -1)
         self.lookups = lookups or Lookups()
         self.undo_stack = undo_stack or QUndoStack(self)
         self.filters = FilterSet()
@@ -276,12 +307,40 @@ class StagedTableModel(QAbstractTableModel):
             self.lookups = lookups
             self.validator.lookups = lookups
         self._db_rows = list(rows)
-        self._staged = [Row.staged(self.spec)]
+        self._staged = [] if self.read_only else [Row.staged(self.spec)]
         self.validator.set_existing_keys(existing_key_map(self.spec, self._db_rows))
         self._reindex()
         self._rebuild_order()
         self.endResetModel()
         self.undo_stack.clear()
+        self.stateChanged.emit()
+
+    def append_rows(self, rows: Sequence[Row]) -> None:
+        """Add more stored rows to what is already here.
+
+        Used by the background loader. When nothing is sorted, filtered or
+        searched the new rows land at the end of the view, so they can be
+        inserted without disturbing the selection or the scroll position;
+        otherwise they have to be merged in and the view is rebuilt.
+        """
+        if not rows:
+            return
+        tidy = not (self._sort_keys or self.filters.active_keys()
+                    or self._quick_search or self._show_deleted)
+        if tidy:
+            at = len(self._staged) + len(self._view)
+            self.beginInsertRows(QModelIndex(), at, at + len(rows) - 1)
+            self._db_rows.extend(rows)
+            self._by_uid.update({r.uid: r for r in rows})
+            self._view.extend(range(len(self._db_rows) - len(rows), len(self._db_rows)))
+            self._order = list(self._view)
+            self.endInsertRows()
+        else:
+            self.beginResetModel()
+            self._db_rows.extend(rows)
+            self._by_uid.update({r.uid: r for r in rows})
+            self._rebuild_order()
+            self.endResetModel()
         self.stateChanged.emit()
 
     def _reindex(self) -> None:
@@ -360,7 +419,10 @@ class StagedTableModel(QAbstractTableModel):
             if row is None:
                 return ""
             if row.is_staged:
-                return "" if row.is_empty(self.spec) else "new"
+                if row.is_empty(self.spec):
+                    return "+"          # type or paste here
+                # A row that passes needs no shouting: green already says so.
+                return "!!!" if row.errors else ""
             return str(row.pk(self.spec))
         if role == Qt.ItemDataRole.TextAlignmentRole:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -374,7 +436,9 @@ class StagedTableModel(QAbstractTableModel):
         if row is None or row.state is RowState.DELETED:
             return base
         col = self.columns[index.column()]
-        editable = col.editable_on_staged if row.is_staged else col.editable_on_existing
+        editable = not self.read_only and (
+            col.editable_on_staged if row.is_staged else col.editable_on_existing
+        )
         if editable:
             base |= Qt.ItemFlag.ItemIsEditable
         return base
@@ -449,14 +513,22 @@ class StagedTableModel(QAbstractTableModel):
 
     def _background(self, row: Row, col: ColumnSpec) -> Optional[QBrush]:
         state = self._cell_state(row, col)
+        if row.is_staged:
+            # One colour for the whole row, so a row that needs attention is
+            # a block rather than a scatter of boxes.
+            if row.is_empty(self.spec):
+                return QBrush(C.staged_blank)
+            if row.errors:
+                return QBrush(C.staged_invalid)
+            if row.warnings:
+                return QBrush(C.warning_cell)
+            return QBrush(C.staged_row)
         if state == CELL_ERROR:
             return QBrush(C.error_cell)
         if state == CELL_WARNING:
             return QBrush(C.warning_cell)
         if row.state is RowState.DELETED:
             return QBrush(C.deleted_row)
-        if row.is_staged:
-            return QBrush(C.staged_blank if row.is_empty(self.spec) else C.staged_row)
         if state == CELL_UPDATED:
             return QBrush(C.updated_cell)
         if row.state is RowState.UPDATED:
@@ -465,7 +537,7 @@ class StagedTableModel(QAbstractTableModel):
             return QBrush(C.updated_row)
         if col.in_key:
             return QBrush(C.key_readonly)
-        return None
+        return QBrush(C.base)
 
     def _tooltip(self, row: Row, col: ColumnSpec, value: Any) -> str:
         bits: list[str] = []
@@ -524,10 +596,13 @@ class StagedTableModel(QAbstractTableModel):
             row = self._by_uid.get(uid)
             if row is None:
                 continue
+            row.remember_original()   # copy-on-write: first edit snapshots it
             row.values[key] = value
             touched.add(uid)
         for uid in touched:
-            self._by_uid[uid].recompute_state()
+            row = self._by_uid[uid]
+            row.search_text = None          # its text changed
+            row.recompute_state()
         self._normalise_staging()
         self.revalidate()
         for uid in touched:
@@ -584,6 +659,8 @@ class StagedTableModel(QAbstractTableModel):
         self.stateChanged.emit()
 
     def _normalise_staging(self) -> None:
+        if self.read_only:
+            return
         """Keep exactly one trailing blank staging row."""
         spec = self.spec
         while (
@@ -687,6 +764,7 @@ class StagedTableModel(QAbstractTableModel):
         self._sort_keys = list(keys)
         self._rebuild_order()
         self.endResetModel()
+        self.viewChanged.emit()
 
     @property
     def sort_keys(self) -> list[tuple[str, bool]]:
@@ -702,6 +780,7 @@ class StagedTableModel(QAbstractTableModel):
         self.endResetModel()
         self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, self.columnCount() - 1)
         self.stateChanged.emit()
+        self.viewChanged.emit()
 
     def clear_filters(self, key: Optional[str] = None) -> None:
         self.beginResetModel()
@@ -710,6 +789,7 @@ class StagedTableModel(QAbstractTableModel):
         self.endResetModel()
         self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, self.columnCount() - 1)
         self.stateChanged.emit()
+        self.viewChanged.emit()
 
     def set_quick_search(self, text: str) -> None:
         """Toolbar search box: keep rows matching the text in any column."""
@@ -721,6 +801,11 @@ class StagedTableModel(QAbstractTableModel):
         self._rebuild_order()
         self.endResetModel()
         self.stateChanged.emit()
+        self.viewChanged.emit()
+
+    @property
+    def quick_search(self) -> str:
+        return self._quick_search
 
     def set_show_deleted(self, show: bool) -> None:
         if show == self._show_deleted:
@@ -745,10 +830,13 @@ class StagedTableModel(QAbstractTableModel):
         def matches_search(row: Row) -> bool:
             if not needle:
                 return True
-            for col in searchable:
-                if needle in display(col, row.values.get(col.key), self.lookups).casefold():
-                    return True
-            return False
+            haystack = row.search_text
+            if haystack is None:
+                haystack = row.search_text = "".join(
+                    display(col, row.values.get(col.key), self.lookups)
+                    for col in searchable
+                ).casefold()
+            return needle in haystack
 
         order = []
         for i, row in enumerate(self._db_rows):
@@ -842,6 +930,67 @@ class StagedTableModel(QAbstractTableModel):
         return self.validator.validate([*self._staged, *self._db_rows])
 
     # ------------------------------------------------------------- changeset
+    def replay(self, payload: Optional[dict]) -> dict[str, int]:
+        """Put a stored branch's changes back into the grid.
+
+        The inverse of :meth:`changeset`: inserts come back as staged rows,
+        updates re-mark the cells they touched, deletes re-mark their rows.
+        Anything naming a row that is no longer there is skipped and counted,
+        because a branch can outlive the rows it refers to.
+        """
+        counts = {"inserts": 0, "updates": 0, "deletes": 0, "missing": 0,
+                  "unreadable": 0}
+        if not isinstance(payload, dict):
+            return counts
+        operations = payload.get("operations") or []
+        if not isinstance(operations, (list, tuple)) or not operations:
+            return counts
+
+        by_pk = {r.values.get(self.spec.pk.key): r for r in self._db_rows}
+        staged: list[Row] = []
+        for op in operations:
+            if not isinstance(op, dict):
+                # A branch written by something else, or an older format.
+                counts["unreadable"] += 1
+                continue
+            kind = op.get("op")
+            if kind not in ("insert", "update", "delete"):
+                counts["unreadable"] += 1
+                continue
+            if kind == "insert":
+                values = {**(op.get("key") or {}), **(op.get("values") or {})}
+                staged.append(Row.staged(self.spec, values))
+                counts["inserts"] += 1
+                continue
+            row = by_pk.get(op.get("pk"))
+            if row is None:
+                counts["missing"] += 1
+                continue
+            if kind == "delete":
+                row.state = RowState.DELETED
+                counts["deletes"] += 1
+            elif kind == "update":
+                row.remember_original()
+                for change in op.get("changes") or []:
+                    if not isinstance(change, dict) or "column" not in change:
+                        counts["unreadable"] += 1
+                        continue
+                    row.values[change["column"]] = change.get("new")
+                row.search_text = None
+                row.recompute_state()
+                counts["updates"] += 1
+
+        if staged:
+            self.beginResetModel()
+            self._staged = staged + self._staged
+            self._reindex()
+            self.endResetModel()
+        self._rebuild_order()
+        self.revalidate(emit=False)
+        self.layoutChanged.emit()
+        self.stateChanged.emit()
+        return counts
+
     def changeset(self) -> ChangeSet:
         return ChangeSet.from_rows(
             self.spec, [*self._staged, *self._db_rows], self.lookups
@@ -987,6 +1136,22 @@ class GridDelegate(QStyledItemDelegate):
             editor.setMaxLength(col.max_length)
         return editor
 
+    def _draw_key_edge(self, painter, rect, column: int) -> None:
+        """One side of the outline round the natural-key block."""
+        first, last = self._model.key_span
+        painter.save()
+        painter.setPen(QPen(C.staged_invalid_edge, 1))
+        painter.drawLine(rect.topLeft(), rect.topRight())
+        painter.drawLine(
+            rect.bottomLeft() - QPoint(0, 1), rect.bottomRight() - QPoint(0, 1)
+        )
+        if column == first:
+            painter.drawLine(rect.topLeft(), rect.bottomLeft())
+        if column == last:
+            edge = rect.right() - 1
+            painter.drawLine(edge, rect.top(), edge, rect.bottom() - 1)
+        painter.restore()
+
     def _fill_combo(self, combo: QComboBox, col, select: Optional[str] = None) -> None:
         """(Re)load a drop-down, with the "add a value" entry on foreign keys."""
         choices = (
@@ -1105,8 +1270,14 @@ class GridDelegate(QStyledItemDelegate):
         if selected:
             painter.fillRect(rect, C.selection)
         state = index.data(ROLE_CELL_STATE)
+        row = self._model.row_at(index.row())
 
-        if state in (CELL_ERROR, CELL_WARNING):
+        if row is not None and row.is_staged:
+            # One outline around the whole natural key, rather than a box per
+            # cell: the key is one thing, so it should look like one thing.
+            if row.errors and self._model.column(index.column()).in_key:
+                self._draw_key_edge(painter, rect, index.column())
+        elif state in (CELL_ERROR, CELL_WARNING):
             colour = C.error_border if state == CELL_ERROR else C.warning_border
             painter.save()
             painter.setPen(QPen(colour, 1))
@@ -1323,7 +1494,16 @@ class GutterHeaderView(QHeaderView):
                 )
 
         label = model.headerData(logicalIndex, Qt.Orientation.Vertical) or ""
-        painter.setPen(QPen(C.gutter_text))
+        colour, bold = C.gutter_text, False
+        if row is not None and row.is_staged:
+            if row.is_empty(model.spec):
+                colour, bold = C.staged_mark, True    # the "+": put new data here
+            elif row.errors:
+                colour, bold = C.attention, True      # the "!!!": needs a look
+        font = painter.font()
+        font.setBold(bold)
+        painter.setFont(font)
+        painter.setPen(QPen(colour))
         painter.drawText(
             rect.adjusted(MARK_ZONE, 0, -7, 0),
             int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
@@ -1932,6 +2112,7 @@ def _copy_row(row: Row) -> Row:
         original=None if row.original is None else dict(row.original),
         state=row.state,
         uid=row.uid,
+        is_new=row.is_new,
     )
     clone.errors = dict(row.errors)
     clone.warnings = dict(row.warnings)
