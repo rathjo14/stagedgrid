@@ -470,7 +470,7 @@ class MainWindow(QMainWindow):
         # which is what decides the window to hold.
         self.view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerItem)
         self.view.verticalScrollBar().valueChanged.connect(self._window_follow)
-        self.setCentralWidget(self.view)
+        self.setCentralWidget(self._centre())
 
         self.branch: Optional[Branch] = None
         self._commit_button = None
@@ -493,6 +493,31 @@ class MainWindow(QMainWindow):
         self.reload()
 
     # ------------------------------------------------------------- chrome
+    def _centre(self) -> QWidget:
+        """The sheet, with the version reading directly above it.
+
+        One version per view, so it is stated once here rather than filling a
+        column with the same value on every row -- and it sits against the
+        sheet it describes, not away in the status bar.
+        """
+        #: Styled by `grid.stylesheet` through this object name, so it follows
+        #: a theme change without anything having to repaint it.
+        bar = QWidget()
+        bar.setObjectName("versionBar")
+        self._version_label = QLabel()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(10, 4, 10, 4)
+        row.addWidget(self._version_label)
+        row.addStretch(1)
+
+        centre = QWidget()
+        column = QVBoxLayout(centre)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(bar)
+        column.addWidget(self.view, 1)
+        return centre
+
     def _build_branch_dock(self) -> None:
         """A collapsible list of branches in the Updates table.
 
@@ -660,15 +685,10 @@ class MainWindow(QMainWindow):
         return None
 
     def _build_status_bar(self) -> None:
-        #: One version per view, so it is stated once, on the left, instead of
-        #: filling a column with the same value on every row.
-        self._version_label = QLabel()
-        self._version_label.setContentsMargins(8, 0, 10, 0)
         self._counts_label = QLabel()
         self._stats_label = QLabel()
         self._message_label = QLabel()
         self._message_label.setContentsMargins(18, 0, 0, 0)
-        self.statusBar().addWidget(self._version_label)
         self.statusBar().addWidget(self._counts_label)
         self.statusBar().addWidget(self._message_label, 1)
         self.statusBar().addPermanentWidget(self._stats_label)

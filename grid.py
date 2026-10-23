@@ -234,6 +234,15 @@ QHeaderView::section {
 }
 QToolBar { border: 0px; padding: 2px; spacing: 2px; }
 QStatusBar::item { border: 0px; }
+/* The strip between the toolbar and the sheet, which says which version is
+   open. Headers-coloured so it reads as part of the sheet's frame rather
+   than as another toolbar. */
+QWidget#versionBar {
+    background: %(header)s;
+    border-top: 1px solid %(grid)s;
+    border-bottom: 1px solid %(grid)s;
+}
+QWidget#versionBar QLabel { color: %(header_text)s; }
 """ % {
         "base": C.base.name(), "text": C.text.name(), "grid": C.grid_line.name(),
         "header": C.header_bg.name(),

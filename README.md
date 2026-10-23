@@ -203,9 +203,9 @@ them, so a selected row still shows its state.
   any cell of it and a fresh blank row appears below; paste 20 rows into it
   and 20 staged rows appear. Natural-key cells there are *not* greyed and
   each one is a drop-down of the live values from A/B/C/D and the enum.
-  The version is not among them: there is one per view, so a staged row
-  inherits it rather than having a column where every cell says the same
-  thing.
+  The version is not among them: there is one per view, so it reads on a strip
+  directly above the sheet and a staged row inherits it, rather than filling a
+  column with the same value on every row.
 
   A key column often needs a value the dimension does not have yet, so there
   are two ways to say so and they do the same thing: **type the label into the
