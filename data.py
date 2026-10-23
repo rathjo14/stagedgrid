@@ -490,7 +490,7 @@ class Validator:
                     hint = f" (expected one of {choices}, ...)"
                 row.errors[col.key] = f"{value.text!r} is not a known {col.header}{hint}"
             else:
-                allowed = ", ".join(col.enum_values) or "the allowed values"
+                allowed = ", ".join(col.enum_names) or "the allowed values"
                 row.errors[col.key] = f"{value.text!r} is not one of {allowed}"
 
     def _check_required(self, row: Row) -> None:
@@ -510,8 +510,13 @@ def _key_error(row: Row, spec: TableSpec, message: str) -> None:
         row.errors[col.key] = message
 
 
+def _enum_name(value):
+    """Enum members live in the grid as their NAME, never their value."""
+    return value.name if isinstance(value, enum.Enum) else value
+
+
 def _normalise(key: tuple) -> tuple:
-    return tuple(getattr(v, "value", v) for v in key)
+    return tuple(_enum_name(v) for v in key)
 
 
 def existing_key_map(spec: TableSpec, rows: Iterable[Row]) -> dict[tuple, int]:
@@ -753,8 +758,8 @@ def _plain(value: Any) -> Any:
     """JSON-safe representation of a stored value."""
     if value is None or isinstance(value, (int, float, str, bool, dict, list)):
         return value
-    if hasattr(value, "value"):  # enum member
-        return value.value
+    if isinstance(value, enum.Enum):  # enum member
+        return value.name
     if hasattr(value, "text"):  # Unresolved
         return value.text
     if isinstance(value, (dt.date, dt.datetime)):
@@ -835,7 +840,7 @@ class Repository:
                 values = dict(zip(keys, record))
                 for key in enum_keys:
                     if values[key] is not None:
-                        values[key] = getattr(values[key], "value", values[key])
+                        values[key] = _enum_name(values[key])
                 rows.append(Row.from_db(values))
         return rows
 
@@ -871,7 +876,7 @@ class Repository:
         out: dict[tuple, int] = {}
         with Session(self.engine) as s:
             for pk, *key in s.execute(select(pk_attr, *key_cols)):
-                out[tuple(getattr(v, "value", v) for v in key)] = pk
+                out[tuple(_enum_name(v) for v in key)] = pk
         return out
 
     def apply(self, changeset: ChangeSet, dry_run: bool = False) -> ApplyResult:

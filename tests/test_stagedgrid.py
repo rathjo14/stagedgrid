@@ -11,6 +11,7 @@ if Path("C:/Windows/Fonts").exists():
     os.environ.setdefault("QT_QPA_FONTDIR", "C:/Windows/Fonts")
 
 import grid
+import enum
 from itertools import product
 
 import pytest
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from sqlalchemy import (
+    Enum as SAEnum,
     Float,
     ForeignKey,
     Integer,
@@ -67,6 +69,7 @@ from schema import (
     display,
     parse,
     seed,
+    to_db,
 )
 
 
@@ -123,7 +126,7 @@ def free_key(model, repo):
     used = repo.natural_keys()
     lookups, spec = model.lookups, model.spec
     choices = [lookups.choices(spec[k]) for k in ("a_id", "b_id", "c_id", "d_id")]
-    for combo in product(*choices, spec["type"].enum_values):
+    for combo in product(*choices, spec["type"].enum_names):
         ids = tuple(
             lookups.id_for(spec[k], label)
             for k, label in zip(("a_id", "b_id", "c_id", "d_id"), combo[:4])
@@ -169,7 +172,7 @@ def test_spec_carries_docs_and_types(spec: TableSpec):
     assert spec["label"].kind is ColumnKind.STR
     assert spec["payload"].kind is ColumnKind.JSON
     assert spec["type"].kind is ColumnKind.ENUM
-    assert spec["type"].enum_values == (
+    assert spec["type"].enum_names == (
         "BASELINE", "STRESS", "SENSITIVITY", "HISTORICAL", "FORECAST",
     )
     assert not spec["payload"].kind.filterable  # jsonb is out of scope
@@ -635,7 +638,7 @@ def test_a_staged_row_can_use_a_new_value_and_the_payload_carries_it(model):
         ("a_id", "ANTARCTICA"), ("b_id", model.lookups.choices(model.spec["b_id"])[0]),
         ("c_id", model.lookups.choices(model.spec["c_id"])[0]),
         ("d_id", model.lookups.choices(model.spec["d_id"])[0]),
-        ("type", model.spec["type"].enum_values[0]),
+        ("type", model.spec["type"].enum_names[0]),
     ):
         model.setData(idx(model, 0, key), value)
     model.revalidate()
@@ -831,7 +834,7 @@ def test_paste_several_rows_into_the_blank_row(view, model, repo):
     key = free_key(model, repo)
     second = list(key)
     second[4] = next(
-        v for v in model.spec["type"].enum_values if v != key[4]
+        v for v in model.spec["type"].enum_names if v != key[4]
     )
     lines = [
         "\t".join(key + ["10", "1", "30", "0", "256", "0.5"]),
@@ -985,6 +988,13 @@ class OtherBase(DeclarativeBase):
     pass
 
 
+class Bucket(enum.Enum):
+    """The case the demo schema cannot show: name != value."""
+
+    FIRST_QUARTER = "q1"
+    SECOND_QUARTER = "q2"
+
+
 class Region(OtherBase):
     __tablename__ = "region"
     region_id = mapped_column(Integer, primary_key=True)
@@ -1008,6 +1018,7 @@ class Reading(OtherBase):
     bucket = mapped_column(String(8), nullable=False, doc="Time bucket")
     value = mapped_column(Float, doc="The measurement")
     note = mapped_column(String(64), doc="Anything worth saying")
+    phase = mapped_column(SAEnum(Bucket), doc="Which quarter")
 
 
 @pytest.fixture
@@ -1075,3 +1086,85 @@ def test_the_grid_drives_a_completely_different_schema(qapp, other_repo):
     result = other_repo.apply(changeset)
     assert result.ok and len(result.inserted) == 1
     assert other_repo.count() == 5
+
+
+def test_the_demo_default_explains_itself(other_repo, repo):
+    """Pointing at someone else's database without setting a model used to
+    fail with 'relation model_a does not exist' and no clue why."""
+    from app import demo_schema_hint
+
+    oops = Exception('(psycopg2.errors.UndefinedTable) relation "model_a" does not exist')
+    hint = demo_schema_hint(repo, oops)          # repo uses the demo ModelE
+    assert "DEMO schema" in hint
+    assert "STAGEDGRID_MODEL" in hint
+    assert "--describe" in hint
+
+    # ...and says nothing once a real model is configured
+    assert demo_schema_hint(other_repo, oops) == ""
+
+
+def test_model_and_label_arguments(other_repo):
+    from app import load_model, parse_labels
+
+    # load_model only has to import "module:Name"; a stdlib target proves it
+    import json
+
+    assert load_model("json:JSONDecoder") is json.JSONDecoder
+    assert parse_labels("region=name, product=title") == {
+        "region": "name", "product": "title"}
+    for bad in ("json", "no_such_module_xyz:Thing", "json:NoSuchName"):
+        with pytest.raises(SystemExit):
+            load_model(bad)
+    with pytest.raises(SystemExit):
+        parse_labels("region")
+
+
+def test_an_enum_shows_its_name_not_its_value(qapp, other_repo):
+    """Kind.BASELINE = "bl" must read as BASELINE, not bl."""
+    spec = other_repo.spec
+    col = spec["phase"]
+    assert col.kind is ColumnKind.ENUM
+    assert col.enum_names == ("FIRST_QUARTER", "SECOND_QUARTER")
+
+    # a member, and the string the grid keeps, both read as the name
+    assert display(col, Bucket.FIRST_QUARTER) == "FIRST_QUARTER"
+    assert display(col, "FIRST_QUARTER") == "FIRST_QUARTER"
+
+    # typing or pasting either spelling lands on the name
+    assert parse(col, "FIRST_QUARTER") == "FIRST_QUARTER"
+    assert parse(col, "first_quarter") == "FIRST_QUARTER"
+    assert parse(col, "q1") == "FIRST_QUARTER"        # tolerant of the raw value
+    assert isinstance(parse(col, "nonsense"), Unresolved)
+
+    # and it goes back to the database as the member itself
+    assert to_db(col, "FIRST_QUARTER") is Bucket.FIRST_QUARTER
+    assert to_db(col, Bucket.SECOND_QUARTER) is Bucket.SECOND_QUARTER
+
+
+def test_an_enum_round_trips_through_the_grid_by_name(qapp, other_repo):
+    model = StagedTableModel(other_repo.spec)
+    model.load(other_repo.load_rows(), other_repo.load_lookups())
+    model.validator.set_existing_keys(other_repo.natural_keys())
+    cell = lambda r, k: model.index(r, model.column_index(k))
+
+    # drop-down offers names
+    delegate_choices = model.spec["phase"].enum_names
+    assert "q1" not in delegate_choices
+
+    row = model.staged_count
+    model.setData(cell(row, "phase"), "SECOND_QUARTER")
+    assert cell(row, "phase").data(Qt.ItemDataRole.DisplayRole) == "SECOND_QUARTER"
+
+    changeset = model.changeset()
+    change = changeset.updates[0].changes[0]
+    assert change.new_text == "SECOND_QUARTER"
+    assert change.new == "SECOND_QUARTER"
+    assert other_repo.apply(changeset).ok
+
+    # ...and the database really holds the member, so it comes back by name
+    reloaded = {r.values["reading_id"]: r for r in other_repo.load_rows()}
+    changed = reloaded[changeset.updates[0].pk]
+    assert changed.values["phase"] == "SECOND_QUARTER"
+    with Session(other_repo.engine) as s:
+        stored = s.get(Reading, changeset.updates[0].pk).phase
+    assert stored is Bucket.SECOND_QUARTER

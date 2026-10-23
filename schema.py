@@ -339,10 +339,16 @@ class ColumnSpec:
     width: int = 110
 
     @property
-    def enum_values(self) -> tuple[str, ...]:
+    def enum_names(self) -> tuple[str, ...]:
+        """Member names, in declaration order.
+
+        The grid shows the name rather than the value: ``Kind.BASELINE`` reads
+        as "BASELINE" whatever it happens to be worth, and it is what
+        SQLAlchemy's Enum type stores by default.
+        """
         if self.enum_class is None:
             return ()
-        return tuple(m.value for m in self.enum_class)
+        return tuple(m.name for m in self.enum_class)
 
     @property
     def editable_on_existing(self) -> bool:
@@ -611,7 +617,7 @@ def display(col: ColumnSpec, value: Any, lookups: Optional["Lookups"] = None) ->
             return str(value)
         return lookups.label(col, value) or f"<{value}>"
     if col.kind is ColumnKind.ENUM:
-        return getattr(value, "value", str(value))
+        return value.name if isinstance(value, enum.Enum) else str(value)
     if col.kind is ColumnKind.FLOAT:
         return f"{float(value):.12g}"
     if col.kind is ColumnKind.JSON:
@@ -654,10 +660,14 @@ def parse(col: ColumnSpec, text: str, lookups: Optional["Lookups"] = None) -> An
         return found if found is not None else Unresolved(stripped)
 
     if col.kind is ColumnKind.ENUM:
-        wanted = stripped.upper()
-        for allowed in col.enum_values:
-            if allowed.upper() == wanted:
-                return allowed
+        wanted = stripped.casefold()
+        for name in col.enum_names:
+            if name.casefold() == wanted:
+                return name
+        # Tolerate a pasted value as well, but store the name.
+        for member in col.enum_class or ():
+            if str(member.value).casefold() == wanted:
+                return member.name
         return Unresolved(stripped)
 
     if col.kind in (ColumnKind.INT, ColumnKind.PK):
@@ -700,9 +710,9 @@ def sort_key(col: ColumnSpec, value: Any, lookups: Optional["Lookups"] = None) -
     if col.kind is ColumnKind.FK:
         return (display(col, value, lookups) or "").casefold()
     if col.kind is ColumnKind.ENUM:
-        values = col.enum_values
+        names = col.enum_names
         text = display(col, value, lookups)
-        return values.index(text) if text in values else len(values)
+        return names.index(text) if text in names else len(names)
     if col.kind.numeric:
         try:
             return float(value)
@@ -724,7 +734,10 @@ def to_db(col: ColumnSpec, value: Any) -> Any:
     if col.kind is ColumnKind.ENUM and col.enum_class is not None:
         if isinstance(value, col.enum_class):
             return value
-        return col.enum_class(value)
+        try:
+            return col.enum_class[value]          # by name, as the grid holds it
+        except KeyError:
+            return col.enum_class(value)          # tolerate a raw value
     return value
 
 
@@ -847,7 +860,7 @@ def describe(spec: "TableSpec") -> str:
         if col.fk is not None:
             source = f"{col.fk.target_table}.{col.fk.label_attr}"
         elif col.enum_class is not None:
-            source = ", ".join(col.enum_values)
+            source = ", ".join(col.enum_names)
         lines.append(
             f"  {col.key:<16}{col.kind.value:<10}{col.header:<16}{flags:<10}{source}"
         )

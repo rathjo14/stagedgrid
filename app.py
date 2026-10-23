@@ -602,7 +602,9 @@ class MainWindow(QMainWindow):
             self.model.validator.set_existing_keys(self.repository.natural_keys())
         except Exception as exc:
             QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Load failed", str(exc))
+            QMessageBox.critical(
+                self, "Load failed", f"{exc}{demo_schema_hint(self.repository, exc)}"
+            )
             return
         QApplication.restoreOverrideCursor()
         note = f"Loaded {len(rows)} row(s) from {self.repository.spec.table_name}"
@@ -848,6 +850,24 @@ def apply_theme(app: QApplication, theme: str = "auto") -> bool:
     return dark
 
 
+def demo_schema_hint(repository, exc: Exception) -> str:
+    """Explain the confusing case: our demo tables, somebody else's database.
+
+    Without this you get "relation \"model_a\" does not exist" naming a table
+    you have never heard of, because no model was configured and the bundled
+    demo schema was used by default.
+    """
+    if repository.model is not ModelE:
+        return ""
+    return (
+        "\n\nNote: no model was configured, so this is the bundled DEMO schema "
+        f"({ModelE.__tablename__}), which does not exist in that database.\n\n"
+        "Point it at your own models with\n"
+        "    export STAGEDGRID_MODEL=package.module:ClassName\n"
+        "or --model, and check it with --describe."
+    )
+
+
 def load_model(ref: str) -> type:
     """Import a mapped class named as ``package.module:ClassName``.
 
@@ -933,7 +953,30 @@ def main(argv: list[str] | None = None) -> int:
         engine=make_engine(args.dsn), model=model, label_columns=labels
     )
 
+    # Say which schema and database before touching either, so a failure
+    # below is readable rather than mysterious. Note that --model's default
+    # comes from the environment, so it never shows up in sys.argv: this line
+    # is what tells you whether it arrived.
+    print(
+        f"stagedgrid: {args.model or 'the bundled demo schema'} "
+        f"({model.__tablename__}) at {args.dsn or dsn()}",
+        file=sys.stderr,
+    )
+    if not args.model:
+        print(
+            "            STAGEDGRID_MODEL is not set in this process and no "
+            "--model was given,\n            so the bundled demo models are "
+            "being used. Run --describe to see what that means.",
+            file=sys.stderr,
+        )
+
     if args.describe:
+        print("environment seen by this process:")
+        for name in ("STAGEDGRID_MODEL", "STAGEDGRID_DSN", "STAGEDGRID_LABELS"):
+            value = os.environ.get(name)
+            print(f"  {name:<18} {value!r}" if value else f"  {name:<18} (not set)")
+        print(f"  python             {sys.executable}")
+        print()
         print(f"dsn: {args.dsn or dsn()}")
         print(describe(repository.spec))
         return 0

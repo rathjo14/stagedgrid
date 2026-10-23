@@ -990,7 +990,7 @@ class GridDelegate(QStyledItemDelegate):
     def _fill_combo(self, combo: QComboBox, col, select: Optional[str] = None) -> None:
         """(Re)load a drop-down, with the "add a value" entry on foreign keys."""
         choices = (
-            list(col.enum_values)
+            list(col.enum_names)
             if col.kind is ColumnKind.ENUM
             else self._model.lookups.choices(col)
         )
@@ -1956,8 +1956,8 @@ def _distinct_key(col: ColumnSpec, text: str):
         except ValueError:
             return (1, 0.0, text.casefold())
     if col.kind is ColumnKind.ENUM:
-        values = col.enum_values
-        return (0, values.index(text) if text in values else len(values), "")
+        names = col.enum_names
+        return (0, names.index(text) if text in names else len(names), "")
     return (0, 0.0, text.casefold())
 
 

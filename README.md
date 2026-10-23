@@ -64,16 +64,39 @@ without touching the code:
 
 ```bash
 # your repo has to be importable: pip install -e it, or put it on PYTHONPATH
-export STAGEDGRID_DSN="postgresql+psycopg2://user:pw@host:5432/yourdb"
-export STAGEDGRID_MODEL="yourrepo.models:FactTable"
+python app.py --describe     --model yourrepo.models:FactTable     --dsn "postgresql+psycopg2://user:pw@host:5432/yourdb"
+```
 
-python app.py --describe     # check it read your schema the way you expect
+Flags are the reliable form: they are visible in the command and cannot be
+lost by a shell that did not carry an export through. The same settings can
+come from the environment instead, which is handy once it works:
+
+```bash
+export STAGEDGRID_MODEL="yourrepo.models:FactTable"
+export STAGEDGRID_DSN="postgresql+psycopg2://user:pw@host:5432/yourdb"
 python app.py
 ```
+
+Note that an environment default never appears in `sys.argv` -- printing argv
+to check will show no `--model` even when it arrived. `--describe` prints the
+variables as the process actually sees them, which is the thing to trust.
 
 Flags work too, and win over the environment: `--dsn`, `--model`, `--labels`.
 With none of them set you get the bundled demo schema, which is what makes it
 possible to keep developing here.
+
+Every run prints which schema and database it is about to use, so check that
+line first if something looks wrong:
+
+```
+stagedgrid: yourrepo.models:FactTable (fact_table) at postgresql+psycopg2://...
+stagedgrid: the bundled demo schema (model_e) at postgresql+psycopg2://...
+```
+
+The second line is the one to watch for. Setting only the DSN and forgetting
+the model points the *demo* models at *your* database, and the first thing you
+see is `relation "model_a" does not exist` -- a table from this repo's demo
+schema, which is nothing to do with yours. The load error says so now.
 
 `--describe` prints what the introspection worked out and exits, which is the
 first thing to run against a real schema:
@@ -123,6 +146,7 @@ What it reads off the mapper:
 | `ForeignKey` + the parent's single unique column | shows `EU-WEST`, not `17`; fills the drop-down |
 | `Column(doc=...)`, falling back to `comment` | header and cell tooltips |
 | python type of each column | editor, validator, alignment, filter operators |
+| `Enum(YourEnum)` | a drop-down of the member **names**: `Kind.BASELINE = "bl"` reads as `BASELINE`, not `bl` |
 | `nullable` | required-field validation |
 
 A sink is just a callable taking the payload dict and returning a one-line
@@ -138,6 +162,21 @@ proves the seam both ways: it drives the demo schema, and
 (different table names, a different primary-key name, a three-column natural
 key with a plain string in it, dimension labels not called `name`) and runs
 the whole flow against it.
+
+### Enum columns
+
+The grid shows the member **name**, not its value, which is also what
+SQLAlchemy's `Enum` type stores by default. So an enum declared as
+
+```python
+class Kind(enum.Enum):
+    BASELINE = "bl"
+```
+
+shows, sorts, filters and copies as `BASELINE`. Typing or pasting accepts
+either spelling -- `BASELINE`, `baseline`, or the raw `bl` -- and stores the
+name; anything else is flagged on the cell. The changeset payload carries the
+name too, and the value written back to the database is the member itself.
 
 ## How the grid behaves
 
