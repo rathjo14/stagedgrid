@@ -471,6 +471,19 @@ class TableSpec:
         return tuple(c for c in self.columns if not c.in_key and not c.is_pk)
 
     @property
+    def version_column(self) -> Optional[ColumnSpec]:
+        """The natural-key foreign key pointing at a version dimension.
+
+        A table like this has one version per set of rows being worked on, so
+        the grid shows it once beside the data rather than as a column where
+        every cell says the same thing.
+        """
+        for col in self.key_columns:
+            if col.fk is not None and col.fk.label_attr in ("version", "revision"):
+                return col
+        return None
+
+    @property
     def fk_columns(self) -> tuple[ColumnSpec, ...]:
         return tuple(c for c in self.columns if c.fk is not None)
 

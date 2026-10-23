@@ -104,6 +104,10 @@ def model(qapp, repo):
     model = StagedTableModel(repo.spec)
     model.load(repo.load_rows(), repo.load_lookups())
     model.validator.set_existing_keys(repo.natural_keys())
+    # The window does this on load: one version for everything on screen, and
+    # staged rows inherit it instead of being typed into a hidden column.
+    newest = repo.latest_version()
+    model.set_version(newest[0] if newest else None)
     return model
 
 
@@ -129,19 +133,39 @@ def idx(model, row, key):
     return model.index(row, model.column_index(key))
 
 
-def free_key(model, repo):
-    """A natural key that is not in the database yet, as display text."""
-    used = repo.natural_keys()
+#: The key columns the grid shows. The version is not among them: there is one
+#: per view, so it is inherited rather than typed.
+KEY_COLUMNS = ("a_id", "b_id", "c_id", "type")
+
+
+def free_keys(model, repo, count=1):
+    """``count`` natural keys not in the database, as display text.
+
+    Only the columns the grid has -- the version comes from the model, and is
+    folded in here to check the whole key really is unused. Each one returned
+    is taken, so two of them never collide with each other.
+    """
+    used = set(repo.natural_keys())
     lookups, spec = model.lookups, model.spec
-    choices = [lookups.choices(spec[k]) for k in ("a_id", "b_id", "c_id", "d_id")]
+    version = model._version_id
+    found = []
+    choices = [lookups.choices(spec[k]) for k in ("a_id", "b_id", "c_id")]
     for combo in product(*choices, spec["type"].enum_names):
         ids = tuple(
             lookups.id_for(spec[k], label)
-            for k, label in zip(("a_id", "b_id", "c_id", "d_id"), combo[:4])
-        ) + (combo[4],)
-        if ids not in used:
-            return list(combo)
-    raise AssertionError("no free natural key")
+            for k, label in zip(("a_id", "b_id", "c_id"), combo[:3])
+        ) + (version, combo[3])
+        if ids in used:
+            continue
+        used.add(ids)
+        found.append(list(combo))
+        if len(found) == count:
+            return found
+    raise AssertionError(f"fewer than {count} free natural keys")
+
+
+def free_key(model, repo):
+    return free_keys(model, repo)[0]
 
 
 def _rows(spec, values):
@@ -378,26 +402,72 @@ def test_locked_key_cells_are_greyed(model):
     assert cell.data(Qt.ItemDataRole.BackgroundRole).color() == C.key_readonly
 
 
-def test_the_id_is_the_row_index_not_a_column(model):
-    """The pk is the gutter label, Excel-style, and never a cell."""
-    assert "id" not in [c.key for c in model.columns]
-    assert model.columnCount() == len(model.spec.columns) - 1
+def gutter(model, row):
+    return model.headerData(
+        row, Qt.Orientation.Vertical, Qt.ItemDataRole.DisplayRole
+    )
 
-    def gutter(row):
-        return model.headerData(
-            row, Qt.Orientation.Vertical, Qt.ItemDataRole.DisplayRole
-        )
 
-    first_db = model.staged_count
-    assert gutter(first_db) == str(model.row_at(first_db).values["id"])
-    assert gutter(0) == "+"                      # "put new data here"
+def test_neither_the_id_nor_the_version_is_a_column(model):
+    """Both are one value per row or per view, so neither earns a column."""
+    keys = [c.key for c in model.columns]
+    assert "id" not in keys                      # it is the row number
+    assert "d_id" not in keys                    # one version per view
+    assert model.columnCount() == len(model.spec.columns) - 2
+
+
+def test_the_row_number_is_the_position_in_the_view(model):
+    """Excel-style: 1, 2, 3 down the gutter, restarting with the view.
+
+    It used to be the primary key, which only the rows currently fetched have
+    -- so every row past the window had a blank where its number should be.
+    """
+    first = model.staged_count
+    assert gutter(model, first) == "1"
+    assert gutter(model, first + 1) == "2"
+    assert gutter(model, model.rowCount() - 1) == str(model.visible_db_rows())
+    # the key is still reachable, just not in the way
+    assert str(model.row_at(first).values["id"]) in gutter_tip(model, first)
+
+    # a different view renumbers from the top rather than carrying on
+    model.set_sort([("weight", True)])
+    assert gutter(model, first) == "1"
+    model.set_quick_search("APAC")
+    assert gutter(model, first) == "1"
+    assert gutter(model, model.rowCount() - 1) == str(model.visible_db_rows())
+
+
+def gutter_tip(model, row):
+    return model.headerData(
+        row, Qt.Orientation.Vertical, Qt.ItemDataRole.ToolTipRole
+    ) or ""
+
+
+def test_a_row_number_is_there_even_before_the_row_is(qapp, repo):
+    """The point of numbering by position: it needs nothing fetched."""
+    model, source, fetch = _merged(repo, sort=(("weight", False),))
+    first = model.staged_count
+    last = model.rowCount() - 1
+    assert model.row_at(last) is None, "pick a row outside the window"
+
+    assert gutter(model, first) == "1"
+    assert gutter(model, last) == str(source.visible_count())
+    assert "" not in [
+        gutter(model, r) for r in range(first, model.rowCount())
+    ], "a row was left without a number"
+
+
+def test_the_staging_block_is_marked_not_numbered(model):
+    """Those rows have no place in the stored order, so they say what they are."""
+    assert gutter(model, 0) == "+"               # "put new data here"
     model.setData(idx(model, 0, "label"), "typed")
-    assert gutter(0) == "!!!"                    # incomplete: needs attention
+    assert gutter(model, 0) == "!!!"             # incomplete: needs attention
     for key, value in (("a_id", "APAC"), ("b_id", "RATES"), ("c_id", "BOND"),
-                       ("d_id", "2026.2"), ("type", "BASELINE")):
+                       ("type", "BASELINE")):
         model.setData(idx(model, 0, key), value)
     model.revalidate()
-    assert gutter(0) == ""                       # ...once it is valid, nothing
+    assert gutter(model, 0) == ""                # ...once it is valid, nothing
+    assert gutter(model, model.staged_count) == "1"   # stored rows start at 1
 
 
 # ------------------------------------------------------------------ editing
@@ -479,7 +549,7 @@ def test_a_label_the_dimension_does_not_have_is_added_not_rejected(model):
 def _fill_key(model, **overrides):
     """Give row 0 a complete natural key, using values the dimensions have."""
     picked = {}
-    for key in ("a_id", "b_id", "c_id", "d_id"):
+    for key in ("a_id", "b_id", "c_id"):
         text = overrides.get(key) or model.lookups.choices(model.spec[key])[0]
         picked[key] = text
         model.setData(idx(model, 0, key), text)
@@ -541,12 +611,73 @@ def test_an_unknown_enum_member_is_still_an_error(model):
 
 
 def test_duplicate_of_an_existing_row_is_an_error(model, repo):
-    for key in ("a_id", "b_id", "c_id", "d_id", "type"):
+    for key in KEY_COLUMNS:
         text = idx(model, model.staged_count, key).data(Qt.ItemDataRole.EditRole)
         model.setData(idx(model, 0, key), text)
     model.revalidate()
     assert "already exists" in model.row_at(0).errors["a_id"]
 
+
+
+def _fill(model, row, col):
+    brush = idx(model, row, col).data(Qt.ItemDataRole.BackgroundRole)
+    return None if brush is None else brush.color().name()
+
+
+def test_the_cell_at_fault_is_a_stronger_yellow_than_its_row(model, repo):
+    """A row that needs attention says which cell needs it.
+
+    The row going yellow is enough when the whole key is the problem, but when
+    one cell is missing or wrong, "these are the ones" beats hunting through
+    twenty columns for a tooltip.
+    """
+    # a part-filled row: the key cells still to fill are the ones at fault
+    model.setData(idx(model, 0, "a_id"), "APAC")
+    model.setData(idx(model, 0, "type"), "BASELINE")
+    model.revalidate()
+    row = model.row_at(0)
+    assert row.errors and row.key_conflict is None
+
+    assert _fill(model, 0, "b_id") == grid.C.staged_invalid_cell.name()
+    assert _fill(model, 0, "c_id") == grid.C.staged_invalid_cell.name()
+    # ...while the cells that are fine stay the row's own yellow
+    assert _fill(model, 0, "a_id") == grid.C.staged_invalid.name()
+    assert _fill(model, 0, "label") == grid.C.staged_invalid.name()
+
+
+def test_a_duplicate_key_stays_one_uniform_block(model, repo):
+    """The key as a whole is the problem, so no one cell is singled out."""
+    for key in KEY_COLUMNS:
+        text = idx(model, model.staged_count, key).data(Qt.ItemDataRole.EditRole)
+        model.setData(idx(model, 0, key), text)
+    model.revalidate()
+    row = model.row_at(0)
+    assert "already exists" in row.errors["a_id"]
+    assert row.key_conflict == row.errors["a_id"]
+
+    uniform = {_fill(model, 0, key) for key in KEY_COLUMNS}
+    assert uniform == {grid.C.staged_invalid.name()}, "the key was broken up"
+    assert _fill(model, 0, "label") == grid.C.staged_invalid.name()
+
+
+def test_a_cell_at_fault_shows_through_a_duplicate(model, repo):
+    """Both at once: the key clashes and some other cell has its own problem.
+
+    The demo schema cannot produce this pair -- every data column is nullable,
+    and an unresolved enum stops the key being complete enough to be checked
+    for a duplicate -- so the state is set directly. A schema with a required
+    data column would reach it the ordinary way.
+    """
+    for key in KEY_COLUMNS:
+        text = idx(model, model.staged_count, key).data(Qt.ItemDataRole.EditRole)
+        model.setData(idx(model, 0, key), text)
+    model.revalidate()
+    row = model.row_at(0)
+    assert row.key_conflict
+
+    row.errors["label"] = "Label is required"
+    assert _fill(model, 0, "label") == grid.C.staged_invalid_cell.name()
+    assert _fill(model, 0, "a_id") == grid.C.staged_invalid.name()
 
 # ----------------------------------------------------------------- deletion
 def test_delete_removes_the_row_and_leaves_a_marker(model):
@@ -737,7 +868,6 @@ def test_a_staged_row_can_use_a_new_value_and_the_payload_carries_it(model):
     for key, value in (
         ("a_id", "ANTARCTICA"), ("b_id", model.lookups.choices(model.spec["b_id"])[0]),
         ("c_id", model.lookups.choices(model.spec["c_id"])[0]),
-        ("d_id", model.lookups.choices(model.spec["d_id"])[0]),
         ("type", model.spec["type"].enum_names[0]),
     ):
         model.setData(idx(model, 0, key), value)
@@ -934,11 +1064,7 @@ def test_copy_writes_tab_separated_text(view, model):
 
 
 def test_paste_several_rows_into_the_blank_row(view, model, repo):
-    key = free_key(model, repo)
-    second = list(key)
-    second[4] = next(
-        v for v in model.spec["type"].enum_names if v != key[4]
-    )
+    key, second = free_keys(model, repo, 2)
     lines = [
         "\t".join(key + ["10", "1", "30", "0", "256", "0.5"]),
         "\t".join(second + ["11", "2", "60", "1", "512", "0.6"]),
@@ -1047,7 +1173,7 @@ def test_distinct_values_respect_other_filters(model):
 # -------------------------------------------------------------- round trip
 def test_commit_applies_inserts_updates_and_deletes(model, repo):
     key = free_key(model, repo)
-    for column, text in zip(("a_id", "b_id", "c_id", "d_id", "type"), key):
+    for column, text in zip(KEY_COLUMNS, key):
         model.setData(idx(model, 0, column), text)
     model.setData(idx(model, 0, "label"), "committed by the test")
 
@@ -1360,7 +1486,7 @@ def test_a_branch_round_trips_through_the_updates_table(model, repo):
 
     # stage one of each kind of change
     key = free_key(model, repo)
-    for column, text in zip(("a_id", "b_id", "c_id", "d_id", "type"), key):
+    for column, text in zip(KEY_COLUMNS, key):
         model.setData(idx(model, 0, column), text)
     model.setData(idx(model, 0, "label"), "added on a branch")
 
@@ -1487,20 +1613,40 @@ def test_opening_a_branch_is_not_an_unsaved_change(window, repo):
     assert not window.unsaved_changes()
 
 
-def test_commit_lights_up_only_when_there_is_something_to_push(window):
+def test_commit_is_green_when_ready_and_yellow_while_blocked(window):
+    """Three states, told apart without reading the tooltip."""
     model = window.model
-    assert not window.action_commit.isEnabled()
+    button = window._commit_button
 
+    # nothing to push: plain and dead
+    assert not window.action_commit.isEnabled()
+    assert not (button.styleSheet() or "")
+
+    # something valid to push: green and clickable
     model.setData(idx(model, model.staged_count, "weight"), "0.5")
     window._refresh()
     assert window.action_commit.isEnabled()
-    assert "background" in (window._commit_button.styleSheet() or "")
+    assert grid.C.commit_ready.name() in button.styleSheet()
 
-    model.setData(idx(model, 0, "a_id"), "NOT-A-REGION")   # now it is invalid
+    # something still to fix: yellow and dead
+    model.setData(idx(model, 0, "label"), "half a row")
     model.revalidate()
     window._refresh()
     assert not window.action_commit.isEnabled()
-    assert "Fix the" in window.action_commit.toolTip()
+    sheet = button.styleSheet()
+    assert grid.C.commit_blocked.name() in sheet
+    # stated for the disabled state too, or Qt dims it back to looking plain
+    assert "QToolButton:disabled" in sheet
+    assert "still need" in window.action_commit.toolTip()
+
+    # and back to green once the row is complete
+    for key, value in (("a_id", "APAC"), ("b_id", "RATES"), ("c_id", "BOND"),
+                       ("type", "BASELINE")):
+        model.setData(idx(model, 0, key), value)
+    model.revalidate()
+    window._refresh()
+    assert window.action_commit.isEnabled()
+    assert grid.C.commit_ready.name() in button.styleSheet()
 
 VIEWS = [
     ("sort by a foreign key label", dict(sort=(("a_id", False),))),
@@ -1884,6 +2030,8 @@ def _merged(repo, sort=(), search="", filters=None, show_deleted=False):
     )
     model.load([], lookups)
     model.validator.set_existing_keys(repo.natural_keys())
+    newest = repo.latest_version()
+    model.set_version(newest[0] if newest else None)
     model.set_window_source(source)
     query = ViewQuery(sort=sort, filters=model.filters, search=search)
 
@@ -1978,13 +2126,16 @@ def test_merged_mode_validates_against_the_whole_version_not_the_window(qapp, re
     model, source, fetch = _merged(repo)
     spec = repo.spec
 
-    far = repo.load_rows(latest_version_only=False)[-1]
+    # the same version the grid is on, or the key would not clash at all
+    far = repo.load_rows()[-1]
     assert not any(
         r.values[spec.pk.key] == far.values[spec.pk.key] for r in model._db_rows
     ), "pick a row the window does not hold"
 
     placeholder = model.staged_count - 1
     for col in spec.key_columns:
+        if col is spec.version_column:
+            continue        # inherited, not typed -- and the same either way
         text = display(col, far.values[col.key], model.lookups)
         model.setData(model.index(placeholder, model.column_index(col.key)), text)
 

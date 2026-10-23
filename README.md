@@ -6,6 +6,8 @@ changeset that is handed to another API on commit.
 
 ![main window](shots/01-main.png)
 
+![a row needing attention, and Commit blocked](shots/11-attention-and-commit.png)
+
 ## Run it
 
 ```bash
@@ -13,7 +15,7 @@ source .venv/Scripts/activate     # or .venv\Scripts\activate.bat on cmd
 python app.py                     # the grid
 python schema.py --reset --rows 400   # (re)seed the demo data
 python schema.py --reset --rows 10000 --one-version   # a realistic single version
-python -m pytest                  # 158 tests, no server needed (sqlite)
+python -m pytest                  # 164 tests, no server needed (sqlite)
 ```
 
 There is no package and nothing to install: five modules in one folder that
@@ -201,6 +203,10 @@ them, so a selected row still shows its state.
   any cell of it and a fresh blank row appears below; paste 20 rows into it
   and 20 staged rows appear. Natural-key cells there are *not* greyed and
   each one is a drop-down of the live values from A/B/C/D and the enum.
+  The version is not among them: there is one per view, so a staged row
+  inherits it rather than having a column where every cell says the same
+  thing.
+
   A key column often needs a value the dimension does not have yet, so there
   are two ways to say so and they do the same thing: **type the label into the
   cell**, or pick **+ New A...** at the top of the drop-down. Either way it is
@@ -214,6 +220,15 @@ them, so a selected row still shows its state.
   unknown one stays an error.
   Sorting and filtering never touch the staging block -- it stays pinned at
   the top, so a filter can't hide work in progress.
+* **Attention.** A staged row that does not pass yet goes yellow, and the
+  cells actually at fault go a stronger yellow -- so "these are the ones" is
+  visible without reading a tooltip. The exception is a duplicate: there the
+  natural key as a whole is the problem, so it stays one uniform block rather
+  than singling out a cell that is individually fine.
+* **Commit.** Green and clickable when there is something valid to push,
+  yellow and dead while something still needs fixing -- the same yellow the
+  rows use, so the button and the grid agree -- and plain when there is
+  nothing to do.
 * **Validation.** Staged rows are checked against the database's natural keys
   and against each other: duplicates, unknown drop-down values, missing
   required fields. A row that does not pass turns yellow all the way across,

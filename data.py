@@ -88,6 +88,11 @@ class Row:
     state: RowState = RowState.CLEAN
     uid: int = field(default_factory=lambda: next(_uid_counter))
     errors: dict[str, str] = field(default_factory=dict)
+    #: Set when the error is the natural key as a whole -- a duplicate --
+    #: rather than any one cell. The grid paints those as one block, and the
+    #: cells with their own problem more strongly, so "these are the ones to
+    #: look at" is visible without reading a tooltip.
+    key_conflict: Optional[str] = None
     warnings: dict[str, str] = field(default_factory=dict)
     is_new: bool = False
     search_text: Optional[str] = field(default=None, repr=False, compare=False)
@@ -161,8 +166,17 @@ class Row:
         return self.state
 
     def is_empty(self, spec: TableSpec) -> bool:
-        """True for an untouched staging row."""
-        return all(is_blank(v) for k, v in self.values.items() if k != spec.pk.key)
+        """True for an untouched staging row.
+
+        The primary key and the version do not count: one is assigned by the
+        database and the other is inherited from the view, so a row holding
+        only those is still a row nobody has typed in.
+        """
+        ignore = {spec.pk.key}
+        version = spec.version_column
+        if version is not None:
+            ignore.add(version.key)
+        return all(is_blank(v) for k, v in self.values.items() if k not in ignore)
 
 
 def _same(a: Any, b: Any) -> bool:
@@ -571,6 +585,7 @@ class Validator:
         for row in rows:
             row.errors.clear()
             row.warnings.clear()
+            row.key_conflict = None
             if row.state is RowState.DELETED or row.state is RowState.CLEAN:
                 continue
             if row.state is RowState.NEW and row.is_empty(spec):
@@ -643,7 +658,8 @@ class Validator:
 
 
 def _key_error(row: Row, spec: TableSpec, message: str) -> None:
-    """Flag every natural-key cell of a row with the same message."""
+    """Flag the natural key as a whole: every key cell, one message."""
+    row.key_conflict = message
     for col in spec.key_columns:
         row.errors[col.key] = message
 
@@ -1084,11 +1100,7 @@ class Repository:
 
     @property
     def version_column(self) -> Optional[ColumnSpec]:
-        """The natural-key foreign key pointing at a version dimension."""
-        for col in self.spec.key_columns:
-            if col.fk is not None and col.fk.label_attr in ("version", "revision"):
-                return col
-        return None
+        return self.spec.version_column
 
     def latest_version(self) -> Optional[tuple[int, str]]:
         """(id, label) of the newest value in the version dimension."""

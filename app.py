@@ -59,7 +59,6 @@ _use_venv_if_needed()
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
-    QColor,
     QKeySequence,
     QUndoStack,
 )
@@ -116,9 +115,6 @@ BLANKS_LABEL = "(Blanks)"   # how an empty value reads in the filter checklist
 #: enough that memory does not follow table size.
 WINDOW_ROWS = 1_000
 
-#: Commit goes this colour when there is something to push.
-COMMIT_READY = QColor("#7B4FBF")
-
 SHORTCUTS = [
     ("Ctrl+C / Ctrl+Shift+C", "Copy selection / copy with headers"),
     ("Ctrl+X / Ctrl+V", "Cut / paste (tab separated, Excel compatible)"),
@@ -132,8 +128,8 @@ SHORTCUTS = [
     ("Alt+Down", "Open the drop-down in a key cell"),
     ("Ctrl+Shift+L", "Filter the current column"),
     ("Ctrl+F", "Jump to the search box"),
-    ("Click an id", "Select the whole row; drag or Ctrl+click for several"),
-    ("Right-click an id", "Delete, revert or restore those rows"),
+    ("Click a row number", "Select the whole row; drag or Ctrl+click for several"),
+    ("Right-click a row number", "Delete, revert or restore those rows"),
     ("Click a header", "Sort; Ctrl+click adds a second sort level"),
     ("Click the red arrow", "Restore the rows deleted at that position"),
 ]
@@ -516,6 +512,9 @@ class MainWindow(QMainWindow):
             | QDockWidget.DockWidgetFeature.DockWidgetClosable
         )
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.branch_dock)
+        # Docked, not floating: it belongs beside the version it applies to.
+        self.branch_dock.setFloating(False)
+        self.branch_list.setMinimumWidth(190)
         self.branch_dock.hide()        # collapsed until asked for
 
     def _build_actions(self) -> None:
@@ -661,10 +660,15 @@ class MainWindow(QMainWindow):
         return None
 
     def _build_status_bar(self) -> None:
+        #: One version per view, so it is stated once, on the left, instead of
+        #: filling a column with the same value on every row.
+        self._version_label = QLabel()
+        self._version_label.setContentsMargins(8, 0, 10, 0)
         self._counts_label = QLabel()
         self._stats_label = QLabel()
         self._message_label = QLabel()
         self._message_label.setContentsMargins(18, 0, 0, 0)
+        self.statusBar().addWidget(self._version_label)
         self.statusBar().addWidget(self._counts_label)
         self.statusBar().addWidget(self._message_label, 1)
         self.statusBar().addPermanentWidget(self._stats_label)
@@ -681,8 +685,18 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             lookups = self.repository.load_lookups()
+            newest = self.repository.latest_version()
             version_id = self.branch.version_id if self.branch else None
             self.model.load([], lookups)
+            # One version for everything on screen, so staged rows inherit it
+            # rather than being typed into a column that is not there.
+            self.model.set_version(version_id or (newest[0] if newest else None))
+            self._show_version(
+                self.branch.version_label if self.branch
+                else (newest[1] if newest else ""),
+                latest=version_id is None
+                or bool(newest and version_id == newest[0]),
+            )
             self.model.validator.set_existing_keys(
                 self.repository.natural_keys(
                     latest_version_only=version_id is None, version_id=version_id
@@ -703,14 +717,6 @@ class MainWindow(QMainWindow):
             f"{self.total_rows:,} row(s) in {self.repository.spec.table_name}, "
             f"holding {self.model.resident_rows():,}"
         )
-        version = self.repository.version_column
-        if version is not None:
-            shown = (
-                self.branch.version_label
-                if self.branch
-                else (self.repository.latest_version() or (None, ""))[1]
-            )
-            note += f"   |   {version.header} {shown}"
         if replayed:
             note += (
                 f"   |   branch {self.branch.label or self.branch.id}: "
@@ -746,6 +752,17 @@ class MainWindow(QMainWindow):
         self.branch_dock.setVisible(shown)
         if shown:
             self._refresh_branches()
+
+    def _show_version(self, label: str, latest: bool) -> None:
+        """State which version is open: "latest", or the one that is not."""
+        self._version_label.setText(
+            f"<b>Inputs Version:</b> {'latest' if latest else label or '?'}"
+        )
+        self._version_label.setToolTip(
+            f"{label} - the newest version, which is what opens by default"
+            if latest
+            else f"{label} - an older version, opened with this branch"
+        )
 
     def _view_shape(self) -> tuple:
         """What the view is defined by, so a re-sort can be told from a delete."""
@@ -946,7 +963,13 @@ class MainWindow(QMainWindow):
         self._refresh_commit_button()
 
     def _refresh_commit_button(self) -> None:
-        """Commit only lights up when there is something to push."""
+        """Three states, readable without the tooltip.
+
+        Green and clickable when there is something valid to push, yellow and
+        dead while something still needs fixing -- the same yellow the rows
+        themselves use, so the button and the grid agree -- and plain when
+        there is nothing to do.
+        """
         pending = self.unsaved_changes()
         blocked = bool(self.model.dirty_counts()["errors"])
         self.action_commit.setEnabled(pending and not blocked)
@@ -958,18 +981,30 @@ class MainWindow(QMainWindow):
         self.action_commit.setToolTip(
             "Nothing to commit - nothing has changed since this was loaded"
             if not pending
-            else f"Fix the {self.model.dirty_counts()['errors']} highlighted row(s) first"
+            else f"{self.model.dirty_counts()['errors']} row(s) still need "
+            "fixing - the cells to look at are the darker yellow ones"
             if blocked
             else f"Push these changes to {where}"
         )
         button = self._commit_button
-        if button is not None:
-            button.setStyleSheet(
-                f"QToolButton {{ background: {COMMIT_READY.name()}; "
-                f"color: white; border-radius: 3px; padding: 2px 10px; }}"
-                if pending and not blocked
-                else ""
-            )
+        if button is None:
+            return
+        if blocked:
+            fill, ink = grid.C.commit_blocked, grid.C.commit_blocked_text
+        elif pending:
+            fill, ink = grid.C.commit_ready, grid.C.commit_ready_text
+        else:
+            button.setStyleSheet("")
+            return
+        button.setStyleSheet(
+            f"QToolButton {{ background: {fill.name()}; color: {ink.name()}; "
+            "border-radius: 3px; padding: 2px 10px; font-weight: bold; }"
+            # Qt dims a disabled button's own colours but not a stylesheet's,
+            # so the yellow has to be stated for that state too or it stays
+            # bright enough to look clickable.
+            f"QToolButton:disabled {{ background: {fill.name()}; "
+            f"color: {ink.name()}; }}"
+        )
 
     def toggle_dark(self, dark: bool) -> None:
         """Repaint everything in the other palette."""

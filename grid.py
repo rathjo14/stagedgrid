@@ -96,6 +96,7 @@ class Palette:
     staged_row: QColor      # staged insert that passes validation
     staged_blank: QColor    # the always-present empty row
     staged_invalid: QColor  # staged insert that does not pass yet
+    staged_invalid_cell: QColor  # ...and the cell that is actually wrong
     staged_invalid_edge: QColor
     staged_mark: QColor     # the "+" on the empty row
     attention: QColor       # the "!!!" on a row that needs looking at
@@ -120,6 +121,10 @@ class Palette:
     sort_icon: QColor
     null_text: QColor
     stripe_updated: QColor  # the gutter stripe on an edited row
+    commit_ready: QColor    # Commit, with something valid to push
+    commit_ready_text: QColor
+    commit_blocked: QColor  # Commit, with something still to fix
+    commit_blocked_text: QColor
 
 
 def _palette(**values) -> Palette:
@@ -148,7 +153,8 @@ LIGHT = _palette(
     selection=(0, 0, 0, 34), focus_border="#3C3C3C",
     updated_row="#DCE9FA", updated_cell="#B6D3F7",
     staged_row="#DCF2E1", staged_blank="#F7F7F7",
-    staged_invalid="#FBEFC0", staged_invalid_edge="#B8860B",
+    staged_invalid="#FBEFC0", staged_invalid_cell="#F6DE7A",
+    staged_invalid_edge="#B8860B",
     staged_mark="#1F7A35", attention="#8A6100",
     key_readonly="#DCDCDC", key_readonly_text="#5E5E5E",
     error_cell="#FBE3E5", error_border="#D1383D",
@@ -159,6 +165,8 @@ LIGHT = _palette(
     header_text="#2B2B2B", gutter_text="#6E6E6E",
     filter_icon="#3A6EA5", filter_icon_idle="#8A8A8A", sort_icon="#555555",
     null_text="#B0B0B0", stripe_updated="#4A8BD4",
+    commit_ready="#1F7A35", commit_ready_text="#FFFFFF",
+    commit_blocked="#E8B621", commit_blocked_text="#3A2D05",
 )
 
 DARK = _palette(
@@ -166,7 +174,8 @@ DARK = _palette(
     selection=(255, 255, 255, 38), focus_border="#C9C9C9",
     updated_row="#23344A", updated_cell="#31567F",
     staged_row="#20402B", staged_blank="#3A3A3A",
-    staged_invalid="#4A3E15", staged_invalid_edge="#D9A520",
+    staged_invalid="#4A3E15", staged_invalid_cell="#6E5A14",
+    staged_invalid_edge="#D9A520",
     staged_mark="#5FBF7A", attention="#E0B344",
     key_readonly="#232323", key_readonly_text="#9B9B9B",
     error_cell="#3C1E22", error_border="#E06C75",
@@ -177,6 +186,8 @@ DARK = _palette(
     header_text="#D4D4D4", gutter_text="#9A9A9A",
     filter_icon="#6FA8DC", filter_icon_idle="#7A7A7A", sort_icon="#AAAAAA",
     null_text="#6A6A6A", stripe_updated="#4A8BD4",
+    commit_ready="#2E9E4B", commit_ready_text="#06240F",
+    commit_blocked="#C79400", commit_blocked_text="#2A1F00",
 )
 
 #: The palette in force. Swap it with :func:`set_theme`, and read it from other
@@ -281,9 +292,16 @@ class StagedTableModel(QAbstractTableModel):
     ) -> None:
         super().__init__(parent)
         self.spec = spec
-        #: The columns the grid shows: everything but the primary key, which
-        #: is the row index in the gutter instead of a cell.
-        self.columns = tuple(c for c in spec.columns if not c.is_pk)
+        #: The version is one value for everything being worked on, so it is
+        #: shown once beside the data instead of as a column where every cell
+        #: says the same thing. New rows inherit it; see `set_version`.
+        self.version_col = spec.version_column
+        #: The columns the grid shows: everything but the primary key, which is
+        #: the row index in the gutter, and the version.
+        hidden = {spec.pk.key} | (
+            {self.version_col.key} if self.version_col is not None else set()
+        )
+        self.columns = tuple(c for c in spec.columns if c.key not in hidden)
         #: First and last grid column of the natural key, for outlining it.
         key_at = [i for i, c in enumerate(self.columns) if c.in_key]
         self.key_span = (key_at[0], key_at[-1]) if key_at else (-1, -1)
@@ -293,6 +311,7 @@ class StagedTableModel(QAbstractTableModel):
         self.validator = Validator(spec, self.lookups)
 
         self._db_rows: list[Row] = []
+        # No version yet -- `set_version` fills it in and tops this one up.
         self._staged: list[Row] = [Row.staged(spec)]
         self._view: list[int] = []
         self._marks: dict[int, list[int]] = {}
@@ -306,6 +325,7 @@ class StagedTableModel(QAbstractTableModel):
         #: hold belong. None means every stored row is here in memory.
         self._window = None
         self._window_at = 0        # visible row the resident slice starts at
+        self._version_id = None    # what new rows get for the version column
         #: Stored rows this session has touched, by uid. In merged mode these
         #: are kept whatever the window is showing -- they are the rows whose
         #: values the database disagrees with, and the only ones anything
@@ -323,13 +343,35 @@ class StagedTableModel(QAbstractTableModel):
         # open a branch, say) leaves the previous session's held rows behind
         # and every one of their edits is counted twice.
         self._held.clear()
-        self._staged = [Row.staged(self.spec)]
+        self._staged = [self.blank_staged()]
         self.validator.set_existing_keys(existing_key_map(self.spec, self._db_rows))
         self._reindex()
         self._rebuild_order()
         self.endResetModel()
         self.undo_stack.clear()
         self.stateChanged.emit()
+
+    def set_version(self, version_id) -> None:
+        """The version every row here belongs to.
+
+        Staged rows are given it outright: the column is not on screen to type
+        it into, and a row in another version would not belong in this view.
+        """
+        self._version_id = version_id
+        for row in self._staged:
+            self._apply_version(row)
+
+    def _apply_version(self, row: Row) -> Row:
+        if self.version_col is not None and self._version_id is not None:
+            row.values[self.version_col.key] = self._version_id
+        return row
+
+    def blank_staged(self, values: Optional[dict] = None) -> Row:
+        """A staging row, carrying the version it belongs to."""
+        row = self._apply_version(Row.staged(self.spec))
+        if values:
+            row.values.update(values)
+        return row
 
     def _reindex(self) -> None:
         self._by_uid = {r.uid: r for r in self._db_rows}
@@ -506,15 +548,24 @@ class StagedTableModel(QAbstractTableModel):
             return None
 
         if role == Qt.ItemDataRole.DisplayRole:
-            row = self.row_at(section)
-            if row is None:
-                return ""
-            if row.is_staged:
+            if section < len(self._staged):
+                row = self._staged[section]
                 if row.is_empty(self.spec):
                     return "+"          # type or paste here
                 # A row that passes needs no shouting: green already says so.
                 return "!!!" if row.errors else ""
-            return str(row.pk(self.spec))
+            # Stored rows are numbered by their place in the view, not by their
+            # primary key: the key is only known for the rows currently
+            # fetched, so it left the column blank everywhere else. The number
+            # restarts whenever the view changes, which is what a row number
+            # means in a spreadsheet. The key is in the tooltip.
+            return str(section - len(self._staged) + 1)
+        if role == Qt.ItemDataRole.ToolTipRole:
+            row = self.row_at(section)
+            if row is None or row.is_staged:
+                return None
+            pk = row.pk(self.spec)
+            return None if pk is None else f"{self.spec.pk.header} {pk}"
         if role == Qt.ItemDataRole.TextAlignmentRole:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         return None
@@ -610,6 +661,12 @@ class StagedTableModel(QAbstractTableModel):
             if row.is_empty(self.spec):
                 return QBrush(C.staged_blank)
             if row.errors:
+                # A duplicate is the key as a whole, so the key stays one
+                # block. Anything else belongs to a cell, and that cell says
+                # so: same yellow, further on.
+                own = row.errors.get(col.key)
+                if own is not None and own != row.key_conflict:
+                    return QBrush(C.staged_invalid_cell)
                 return QBrush(C.staged_invalid)
             if row.warnings:
                 return QBrush(C.warning_cell)
@@ -774,7 +831,7 @@ class StagedTableModel(QAbstractTableModel):
         ):
             self._staged.pop()
         if not self._staged or not self._staged[-1].is_empty(spec):
-            self._staged.append(Row.staged(spec))
+            self._staged.append(self.blank_staged())
         self._reindex()
         self.revalidate(emit=False)
         self.endResetModel()
@@ -820,7 +877,7 @@ class StagedTableModel(QAbstractTableModel):
         if not self._staged or not self._staged[-1].is_empty(spec):
             at = len(self._staged)
             self.beginInsertRows(QModelIndex(), at, at)
-            blank = Row.staged(spec)
+            blank = self.blank_staged()
             self._staged.append(blank)
             self._by_uid[blank.uid] = blank
             self.endInsertRows()
@@ -831,7 +888,7 @@ class StagedTableModel(QAbstractTableModel):
         after = [_copy_row(r) for r in before]
         position = len(after) - 1 if at is None else max(0, min(at, len(after)))
         for _ in range(count):
-            after.insert(position, Row.staged(self.spec))
+            after.insert(position, self.blank_staged())
         self.undo_stack.push(
             StagingCommand(self, before, after, f"add {count} staged row(s)")
         )
@@ -1162,7 +1219,7 @@ class StagedTableModel(QAbstractTableModel):
                 continue
             if kind == "insert":
                 values = {**(op.get("key") or {}), **(op.get("values") or {})}
-                staged.append(Row.staged(self.spec, values))
+                staged.append(self.blank_staged(values))
                 counts["inserts"] += 1
                 continue
             row = by_pk.get(op.get("pk"))
@@ -2046,7 +2103,6 @@ class GridView(QTableView):
 
     def _paste_block(self, top: int, left: int, grid: list[list[str]]) -> None:
         model = self._model
-        spec = model.spec
         skipped = 0
         failed = 0
 
@@ -2064,7 +2120,7 @@ class GridView(QTableView):
             target_row = top + row_offset
             if anchor_in_staging:
                 while target_row >= len(staging_after):
-                    staging_after.append(Row.staged(spec))
+                    staging_after.append(model.blank_staged())
                 row = staging_after[target_row]
             else:
                 if target_row >= model.rowCount():
@@ -2326,6 +2382,7 @@ def _copy_row(row: Row) -> Row:
     )
     clone.errors = dict(row.errors)
     clone.warnings = dict(row.warnings)
+    clone.key_conflict = row.key_conflict
     return clone
 
 
