@@ -1,0 +1,7 @@
+PySide6-Essentials>=6.5
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
+
+# tests only
+pytest
+pytest-qt
