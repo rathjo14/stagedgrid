@@ -800,7 +800,11 @@ class Repository:
     ) -> None:
         self.engine = engine or make_engine()
         self.model = model
-        self.spec = TableSpec.from_mapped_class(model, label_columns or LABEL_COLUMNS)
+        if label_columns is None:
+            # The demo mapping belongs to the demo models only: with your own
+            # models, let the introspection work the label columns out.
+            label_columns = LABEL_COLUMNS if model is ModelE else {}
+        self.spec = TableSpec.from_mapped_class(model, label_columns)
 
     def load_lookups(self) -> Lookups:
         lookups = Lookups()

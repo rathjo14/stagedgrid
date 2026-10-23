@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import importlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
@@ -57,9 +59,7 @@ _use_venv_if_needed()
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
-    QColor,
     QKeySequence,
-    QPalette,
     QUndoStack,
 )
 from PySide6.QtWidgets import (
@@ -85,16 +85,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from schema import ColumnSpec, make_engine
+from schema import ColumnSpec, ModelE, describe, dsn, make_engine
 from data import ColumnFilter, Condition, Join, Op, Repository, ops_for
 import grid
 from grid import GridView, StagedTableModel, set_theme, stylesheet
 
-BLANKS_LABEL = "(Blanks)"
+import qdarktheme    # the window chrome
+import darkdetect     # which way "auto" goes (Qt only knows from 6.5)
 
-INSERT_COLOUR = QColor("#1F7A35")
-UPDATE_COLOUR = QColor("#1F5FA8")
-DELETE_COLOUR = QColor("#B3262C")
+BLANKS_LABEL = "(Blanks)"   # how an empty value reads in the filter checklist
 
 SHORTCUTS = [
     ("Ctrl+C / Ctrl+Shift+C", "Copy selection / copy with headers"),
@@ -642,7 +641,7 @@ class MainWindow(QMainWindow):
 
     def toggle_dark(self, dark: bool) -> None:
         """Repaint everything in the other palette."""
-        apply_theme(QApplication.instance(), dark)
+        apply_theme(QApplication.instance(), "dark" if dark else "light")
         self.setStyleSheet(stylesheet())
         for widget in (
             self.view,
@@ -836,52 +835,84 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def wants_dark(app: QApplication) -> bool:
-    """True when the desktop is in dark mode (Qt 6.5+; False if it can't tell)."""
-    try:
-        return app.styleHints().colorScheme() == Qt.ColorScheme.Dark
-    except AttributeError:  # pragma: no cover - older Qt
-        return False
+def apply_theme(app: QApplication, theme: str = "auto") -> bool:
+    """Theme the chrome with pyqtdarktheme; return whether we ended up dark.
 
-
-def apply_theme(app: QApplication, dark: bool) -> None:
-    """Switch the grid palette and the rest of the widgets together."""
+    pyqtdarktheme styles the window, menus, toolbar, dialogs and scrollbars.
+    The grid paints its own cells on top from the palette in grid.py, which is
+    what ``set_theme`` picks -- see the colour section of the README.
+    """
+    qdarktheme.setup_theme(theme)
+    dark = theme == "dark" or (theme == "auto" and bool(darkdetect.isDark()))
     set_theme(dark)
-    app.setStyle("Fusion")
-    palette = QPalette()
-    if dark:
-        for role, colour in {
-            QPalette.ColorRole.Window: "#1E1E1E",
-            QPalette.ColorRole.WindowText: "#E4E4E4",
-            QPalette.ColorRole.Base: "#252526",
-            QPalette.ColorRole.AlternateBase: "#2A2A2B",
-            QPalette.ColorRole.Text: "#E4E4E4",
-            QPalette.ColorRole.Button: "#2D2D30",
-            QPalette.ColorRole.ButtonText: "#E4E4E4",
-            QPalette.ColorRole.ToolTipBase: "#2D2D30",
-            QPalette.ColorRole.ToolTipText: "#E4E4E4",
-            QPalette.ColorRole.PlaceholderText: "#8A8A8A",
-            QPalette.ColorRole.Highlight: "#3A6EA5",
-            QPalette.ColorRole.HighlightedText: "#FFFFFF",
-            QPalette.ColorRole.Link: "#6FA8DC",
-        }.items():
-            palette.setColor(role, QColor(colour))
-        for role in (
-            QPalette.ColorRole.WindowText,
-            QPalette.ColorRole.Text,
-            QPalette.ColorRole.ButtonText,
-        ):
-            palette.setColor(
-                QPalette.ColorGroup.Disabled, role, QColor("#6A6A6A")
-            )
-    else:
-        palette = app.style().standardPalette()
-    app.setPalette(palette)
+    return dark
+
+
+def load_model(ref: str) -> type:
+    """Import a mapped class named as ``package.module:ClassName``.
+
+    Your models do not have to live here -- anything importable works, so put
+    your repo on PYTHONPATH or pip install it, and point at it.
+    """
+    module_name, _, attr = ref.partition(":")
+    if not module_name or not attr:
+        raise SystemExit(
+            f"--model wants 'package.module:ClassName', got {ref!r}"
+        )
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise SystemExit(f"--model {ref}: {exc}") from None
+    try:
+        return getattr(module, attr)
+    except AttributeError:
+        raise SystemExit(f"--model {ref}: {module_name} has no {attr!r}") from None
+
+
+def parse_labels(text: str) -> dict[str, str]:
+    """``"region=code,version=tag"`` -> which column of a dimension to show."""
+    mapping = {}
+    for pair in text.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        table, sep, column = pair.partition("=")
+        if not sep:
+            raise SystemExit(f"--labels wants 'table=column', got {pair!r}")
+        mapping[table.strip()] = column.strip()
+    return mapping
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Staged editor for a fact table.")
-    parser.add_argument("--dsn", default=None, help="SQLAlchemy URL")
+    parser = argparse.ArgumentParser(
+        description="Staged editor for a fact table.",
+        epilog="Point it at your own schema with --model and --dsn, or set "
+               "STAGEDGRID_MODEL / STAGEDGRID_DSN. With neither, it opens the "
+               "bundled demo schema.",
+    )
+    parser.add_argument(
+        "--dsn",
+        default=None,
+        help="SQLAlchemy URL (or $STAGEDGRID_DSN)",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("STAGEDGRID_MODEL"),
+        help="the mapped class to edit, as package.module:ClassName "
+             "(or $STAGEDGRID_MODEL). Defaults to the demo schema.",
+    )
+    parser.add_argument(
+        "--labels",
+        default=os.environ.get("STAGEDGRID_LABELS"),
+        help="which column of a dimension table to show instead of its id, "
+             "as table=column,table=column. Only needed when the guess is "
+             "wrong -- see --describe.",
+    )
+    parser.add_argument(
+        "--describe",
+        action="store_true",
+        help="print what the grid worked out about the table, and exit",
+    )
     parser.add_argument("--limit", type=int, default=None, help="max rows to load")
     parser.add_argument(
         "--changesets",
@@ -896,11 +927,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    model = load_model(args.model) if args.model else ModelE
+    labels = parse_labels(args.labels) if args.labels else None
+    repository = Repository(
+        engine=make_engine(args.dsn), model=model, label_columns=labels
+    )
+
+    if args.describe:
+        print(f"dsn: {args.dsn or dsn()}")
+        print(describe(repository.spec))
+        return 0
+
     app = QApplication(sys.argv[:1])
     app.setApplicationName("stagedgrid")
-    apply_theme(app, wants_dark(app) if args.theme == "auto" else args.theme == "dark")
+    apply_theme(app, args.theme)
 
-    repository = Repository(engine=make_engine(args.dsn))
     window = MainWindow(
         repository, sink=file_sink(args.changesets), limit=args.limit
     )

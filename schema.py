@@ -828,6 +828,37 @@ class Lookups:
         return col.fk is not None and self._key(col) in self._labels
 
 
+def describe(spec: "TableSpec") -> str:
+    """What the grid worked out about a table -- print this when wiring up
+    your own models, to check it read them the way you expect."""
+    lines = [
+        f"{spec.model.__name__} -> table {spec.table_name!r}",
+        f"  primary key      {spec.pk.key}   (shown as the row index, not a column)",
+        f"  natural key      {spec.unique_constraint or '(none found!)'}",
+        "",
+        f"  {'column':<16}{'kind':<10}{'header':<16}{'flags':<10}source",
+    ]
+    for col in spec.columns:
+        flags = "".join(
+            ("P" if col.is_pk else "-", "K" if col.in_key else "-",
+             "N" if col.nullable else "-")
+        )
+        source = ""
+        if col.fk is not None:
+            source = f"{col.fk.target_table}.{col.fk.label_attr}"
+        elif col.enum_class is not None:
+            source = ", ".join(col.enum_values)
+        lines.append(
+            f"  {col.key:<16}{col.kind.value:<10}{col.header:<16}{flags:<10}{source}"
+        )
+    lines += [
+        "",
+        "  P = primary key, K = part of the natural key (greyed on stored rows,",
+        "  a drop-down on staged rows), N = nullable.",
+    ]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # engine and demo data
 

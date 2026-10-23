@@ -22,7 +22,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from sqlalchemy import create_engine
+from sqlalchemy import (
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    create_engine,
+)
+from sqlalchemy.orm import DeclarativeBase, Session, mapped_column
 from sqlalchemy.pool import StaticPool
 
 from data import (
@@ -677,6 +685,59 @@ def test_the_new_value_entry_is_never_committed_as_a_value(view, model):
     assert model.row_at(0).values["a_id"] is None   # nothing was written
 
 
+def test_pasting_past_the_right_edge_drops_the_overflow(view, model):
+    """A paste wider than the remaining columns must not fall off the end."""
+    row = model.staged_count
+    last = model.columnCount() - 1
+    QGuiApplication.clipboard().setText("	".join(["7", "8", "9"]))
+    view.setCurrentIndex(model.index(row, last))
+
+    view.paste()   # used to raise IndexError once the id column left the grid
+
+    assert model.rowCount() > 0          # still alive
+    # anchored one column from the end, only the first value has anywhere to go
+    view.setCurrentIndex(idx(model, row, "retry_limit"))
+    QGuiApplication.clipboard().setText("	".join(["3"] * 40))
+    view.paste()
+    assert idx(model, row, "retry_limit").data(Qt.ItemDataRole.DisplayRole) == "3"
+
+
+def test_pyqtdarktheme_does_not_flatten_the_cell_colours(view, model):
+    """pyqtdarktheme's chrome must not eat the grid's per-cell brushes.
+
+    Its stylesheet carries ``QAbstractItemView::item`` rules, and such a rule
+    normally makes Qt take over item painting and ignore BackgroundRole. It
+    does not here -- this keeps it that way.
+    """
+    qdarktheme = pytest.importorskip("qdarktheme")
+    import grid as grid_module
+
+    host = QWidget()
+    QVBoxLayout(host).addWidget(view)
+    host.resize(1100, 420)
+    host.show()
+    model.setData(idx(model, 0, "a_id"), "NOT-A-REGION")
+    model.revalidate()
+
+    def pixel(r, key):
+        rect = view.visualRect(idx(model, r, key))
+        assert view.viewport().rect().contains(rect.center()), f"{key} off-screen"
+        shot = view.viewport().grab().toImage()
+        return shot.pixelColor(rect.center().x(), rect.top() + 4).name()
+
+    for dark in (True, False):
+        set_theme(dark)
+        qdarktheme.setup_theme("dark" if dark else "light")
+        host.setStyleSheet(stylesheet())
+        QApplication.processEvents()
+        palette = DARK if dark else LIGHT
+        assert pixel(0, "a_id") == palette.error_cell.name().lower()
+        assert pixel(model.staged_count + 1, "a_id") == palette.key_readonly.name()
+        assert pixel(model.staged_count + 1, "run_count") == palette.base.name()
+    set_theme(False)
+    assert grid_module.C is LIGHT
+
+
 def test_dark_theme_swaps_the_palette(model):
     cell = idx(model, model.staged_count, "a_id")
     assert cell.data(Qt.ItemDataRole.BackgroundRole).color() == LIGHT.key_readonly
@@ -913,3 +974,104 @@ def test_dry_run_reports_the_constraint_violation(model, repo):
     assert not result.ok
     assert "unique" in (result.error or "").lower()
     assert repo.count() == len(repo.load_rows())  # nothing was written
+
+
+# --------------------------------------------------- somebody else's schema
+# Nothing below resembles the demo models: different table names, a different
+# primary-key name, a three-column natural key with a plain string in it, and
+# dimension labels that are not called "name". If the grid can drive this, it
+# can drive yours.
+class OtherBase(DeclarativeBase):
+    pass
+
+
+class Region(OtherBase):
+    __tablename__ = "region"
+    region_id = mapped_column(Integer, primary_key=True)
+    code = mapped_column(String(16), unique=True, nullable=False, doc="Region code")
+
+
+class Product(OtherBase):
+    __tablename__ = "product"
+    product_id = mapped_column(Integer, primary_key=True)
+    sku = mapped_column(String(16), unique=True, nullable=False, doc="Stock code")
+
+
+class Reading(OtherBase):
+    __tablename__ = "reading"
+    __table_args__ = (
+        UniqueConstraint("region_id", "product_id", "bucket", name="uq_reading"),
+    )
+    reading_id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    region_id = mapped_column(ForeignKey("region.region_id"), nullable=False)
+    product_id = mapped_column(ForeignKey("product.product_id"), nullable=False)
+    bucket = mapped_column(String(8), nullable=False, doc="Time bucket")
+    value = mapped_column(Float, doc="The measurement")
+    note = mapped_column(String(64), doc="Anything worth saying")
+
+
+@pytest.fixture
+def other_repo():
+    engine = create_engine(
+        "sqlite://",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+        future=True,
+    )
+    OtherBase.metadata.create_all(engine)
+    with Session(engine) as s, s.begin():
+        s.add_all([Region(code="NORTH"), Region(code="SOUTH")])
+        s.add_all([Product(sku="AAA"), Product(sku="BBB")])
+    with Session(engine) as s, s.begin():
+        for r in (1, 2):
+            for p in (1, 2):
+                s.add(Reading(region_id=r, product_id=p, bucket="2026Q1",
+                              value=float(r * p), note="seeded"))
+    return Repository(engine=engine, model=Reading)
+
+
+def test_the_grid_drives_a_completely_different_schema(qapp, other_repo):
+    spec = other_repo.spec
+    assert spec.table_name == "reading"
+    assert spec.pk.key == "reading_id"
+    assert spec.unique_constraint == "uq_reading"
+    assert [c.key for c in spec.key_columns] == ["region_id", "product_id", "bucket"]
+    # the dimension label columns were worked out without being told
+    assert spec["region_id"].fk.label_attr == "code"
+    assert spec["product_id"].fk.label_attr == "sku"
+    assert spec["region_id"].header == "Region"
+    assert spec["value"].doc == "The measurement"
+
+    model = StagedTableModel(spec)
+    model.load(other_repo.load_rows(), other_repo.load_lookups())
+    model.validator.set_existing_keys(other_repo.natural_keys())
+    assert model.total_db_rows() == 4
+    assert "reading_id" not in [c.key for c in model.columns]   # pk is the gutter
+    assert model.lookups.choices(spec["region_id"]) == ["NORTH", "SOUTH"]
+
+    # a staged row behaves exactly as it does for the demo schema
+    def cell(row, key):
+        return model.index(row, model.column_index(key))
+
+    for key, value in (("region_id", "NORTH"), ("product_id", "AAA"),
+                       ("bucket", "2026Q1")):
+        model.setData(cell(0, key), value)
+    model.revalidate()
+    assert "already exists" in model.row_at(0).errors["region_id"]
+
+    model.setData(cell(0, "bucket"), "2026Q2")      # now it is free
+    model.setData(cell(0, "value"), "9.5")
+    model.revalidate()
+    assert model.row_at(0).errors == {}
+
+    changeset = model.changeset()
+    assert changeset.counts["inserts"] == 1
+    payload = changeset.to_payload()
+    assert payload["table"] == "reading"
+    assert payload["operations"][0]["key_labels"] == {
+        "region_id": "NORTH", "product_id": "AAA", "bucket": "2026Q2",
+    }
+    assert other_repo.apply(changeset, dry_run=True).ok
+    result = other_repo.apply(changeset)
+    assert result.ok and len(result.inserted) == 1
+    assert other_repo.count() == 5

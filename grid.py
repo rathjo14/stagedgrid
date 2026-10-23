@@ -1483,23 +1483,31 @@ class GridView(QTableView):
         self.statsChanged.emit(self.selection_summary())
 
     def selection_summary(self) -> str:
-        indexes = self.selectedIndexes()
-        if not indexes:
+        """Excel's status-bar line. Reads values straight off the rows."""
+        model = self._model
+        rows, cols = self._selected_block()
+        if not rows or not cols:
             return ""
+        specs = [model.column(c) for c in cols]
         numbers: list[float] = []
         filled = 0
-        for index in indexes:
-            col = self._model.column(index.column())
-            value = index.data(ROLE_RAW)
-            if not is_blank(value):
-                filled += 1
-            if col.kind.numeric:
-                try:
-                    numbers.append(float(value))
-                except (TypeError, ValueError):
-                    pass
-        bits = [f"{len(indexes)} cell(s)", f"{filled} filled"]
-        rows = {i.row() for i in indexes}
+        cells = 0
+        for visual in rows:
+            row = model.row_at(visual)
+            if row is None:
+                continue
+            values = row.values
+            for col in specs:
+                cells += 1
+                value = values.get(col.key)
+                if not is_blank(value):
+                    filled += 1
+                if col.kind.numeric:
+                    try:
+                        numbers.append(float(value))
+                    except (TypeError, ValueError):
+                        pass
+        bits = [f"{cells} cell(s)", f"{filled} filled"]
         if len(rows) > 1:
             bits.append(f"{len(rows)} rows")
         if numbers:
@@ -1587,30 +1595,46 @@ class GridView(QTableView):
 
     # ------------------------------------------------------------- clipboard
     def _selected_block(self) -> tuple[list[int], list[int]]:
-        indexes = self.selectedIndexes()
-        if not indexes:
+        """Rows and columns the selection covers.
+
+        Walks the selection's rectangles rather than ``selectedIndexes()``,
+        which would build one QModelIndex per selected cell -- 50k of them
+        after Ctrl+A on a full table.
+        """
+        ranges = self.selectionModel().selection()
+        if not ranges:
             current = self.currentIndex()
             if not current.isValid():
                 return [], []
             return [current.row()], [current.column()]
-        rows = sorted({i.row() for i in indexes})
-        cols = sorted({i.column() for i in indexes})
-        return rows, cols
+        rows: set[int] = set()
+        cols: set[int] = set()
+        for block in ranges:
+            rows.update(range(block.top(), block.bottom() + 1))
+            cols.update(range(block.left(), block.right() + 1))
+        return sorted(rows), sorted(cols)
 
     def copy_selection(self, with_headers: bool = False) -> None:
         rows, cols = self._selected_block()
         if not rows:
             return
+        # Read the rows straight out of the model rather than through a
+        # QModelIndex and data() per cell: same text, a fraction of the work,
+        # which is what makes copying the whole table bearable.
+        model = self._model
+        specs = [model.column(c) for c in cols]
+        lookups = model.lookups
         buffer = io.StringIO()
         writer = csv.writer(buffer, delimiter="\t", lineterminator="\r\n")
         if with_headers:
-            writer.writerow([self._model.column(c).header for c in cols])
-        for row in rows:
+            writer.writerow([c.header for c in specs])
+        for visual in rows:
+            row = model.row_at(visual)
+            if row is None:
+                continue
+            values = row.values
             writer.writerow(
-                [
-                    self._model.index(row, col).data(Qt.ItemDataRole.DisplayRole) or ""
-                    for col in cols
-                ]
+                [display(c, values.get(c.key), lookups) for c in specs]
             )
         QGuiApplication.clipboard().setText(buffer.getvalue().rstrip("\r\n"))
         self._model.message.emit(
@@ -1671,9 +1695,9 @@ class GridView(QTableView):
 
             for col_offset, raw in enumerate(line):
                 column_index = left + col_offset
-                if column_index >= len(spec.columns):
-                    break
-                col = self._model.columns[column_index]
+                if column_index >= len(model.columns):
+                    break  # the paste is wider than the grid: drop the overflow
+                col = model.columns[column_index]
                 editable = (
                     col.editable_on_staged
                     if anchor_in_staging

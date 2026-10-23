@@ -25,6 +25,13 @@ Fresh environment:
 python -m venv .venv && .venv/Scripts/python -m pip install -r requirements.txt
 ```
 
+Built for a locked environment: **Python 3.10, PySide6 6.4.1** (Essentials and
+Addons), SQLAlchemy 2.x, psycopg2, pyqtdarktheme. The suite and every runtime
+path are verified on exactly that, and also on Python 3.11 / PySide6 6.12 /
+SQLAlchemy 2.1, so newer versions are fine.
+
+pandas is deliberately not used -- see the note in `requirements.txt`.
+
 The DSN defaults to `postgresql+psycopg2://postgres:postgres@localhost:5432/benchmark`;
 override with `STAGEDGRID_DSN` or `--dsn`. `--limit N` caps the initial load,
 `--changesets DIR` says where committed payloads are written.
@@ -52,8 +59,62 @@ logic without a screen.
 
 ## Pointing it at your real models
 
-Nothing in the UI knows a column name. `TableSpec.from_mapped_class(ModelE)`
-reads the mapper and works out the rest:
+Nothing in the UI knows a column name, so your own mapped classes drop in
+without touching the code:
+
+```bash
+# your repo has to be importable: pip install -e it, or put it on PYTHONPATH
+export STAGEDGRID_DSN="postgresql+psycopg2://user:pw@host:5432/yourdb"
+export STAGEDGRID_MODEL="yourrepo.models:FactTable"
+
+python app.py --describe     # check it read your schema the way you expect
+python app.py
+```
+
+Flags work too, and win over the environment: `--dsn`, `--model`, `--labels`.
+With none of them set you get the bundled demo schema, which is what makes it
+possible to keep developing here.
+
+`--describe` prints what the introspection worked out and exits, which is the
+first thing to run against a real schema:
+
+```
+Reading -> table 'reading'
+  primary key      reading_id   (shown as the row index, not a column)
+  natural key      uq_reading
+
+  column          kind      header          flags     source
+  region_id       fk        Region          -K-       region.code
+  product_id      fk        Product sku     -K-       product.sku
+  bucket          str       Bucket          -K-
+  value           float     Value           --N
+```
+
+Check three things in that output:
+
+| | |
+| --- | --- |
+| **natural key** | the `UniqueConstraint` it chose -- the one whose columns get greyed out on stored rows and become drop-downs on staged ones. It picks the constraint with the most columns, so if your table has several, confirm it chose the right one. |
+| **source** on each fk | which column of the dimension table is shown instead of the id. It guesses the single unique non-key column. Override with `--labels region=name,product=title` when the guess is wrong. |
+| **flags** | `K` on exactly the columns that make up your natural key, `N` on the nullable ones (non-nullable data columns become required fields). |
+
+Headers are derived from the attribute names (`_header_for` and
+`_header_for_fk` in `schema.py`, one short function each) -- change those two
+if you want different wording.
+
+From code rather than the command line:
+
+```python
+from data import Repository
+from app import MainWindow
+from yourrepo.models import FactTable
+
+repo = Repository(engine=your_engine, model=FactTable,
+                  label_columns={"region": "name"})   # only if a guess is wrong
+MainWindow(repo, sink=your_api.submit_changes).show()
+```
+
+What it reads off the mapper:
 
 | what it reads | what the UI does with it |
 | --- | --- |
@@ -64,27 +125,19 @@ reads the mapper and works out the rest:
 | python type of each column | editor, validator, alignment, filter operators |
 | `nullable` | required-field validation |
 
-So the integration is:
-
-```python
-from data import Repository
-from app import MainWindow
-from yourrepo.models import YourFactTable
-
-repo = Repository(engine=your_engine, model=YourFactTable,
-                  label_columns={"your_dim_table": "code"})   # optional override
-MainWindow(repo, sink=your_api.submit_changes).show()
-```
-
-A **sink** is just a callable taking the payload dict and returning a one-line
+A sink is just a callable taking the payload dict and returning a one-line
 string for the status bar. `file_sink("changesets")` (the default) writes
 `changesets/changeset-<stamp>.json`. If your API should be the only writer,
 drop the `self.repository.apply(...)` call in `MainWindow.commit` and keep the
-`sink(...)` — the validation and dry-run machinery in front of it stays useful.
+`sink(...)` -- the validation and dry-run machinery in front of it stays useful.
 
-`label_columns` is only needed when a parent table has several unique columns
-and you want a specific one (here `model_d` uses `version`, which is
-auto-detected anyway).
+The demo models and the seeder stay in `schema.py` and are only used when
+`--model` is unset, so this repo keeps working as a sandbox. The test suite
+proves the seam both ways: it drives the demo schema, and
+`test_the_grid_drives_a_completely_different_schema` builds an unrelated one
+(different table names, a different primary-key name, a three-column natural
+key with a plain string in it, dimension labels not called `name`) and runs
+the whole flow against it.
 
 ## How the grid behaves
 
@@ -192,10 +245,32 @@ inserts, so a key can be reused) and the payload goes to the sink.
 
 ## Colours and dark mode
 
-Dark mode follows the desktop. Override with `--theme light|dark`, or flip it
-live from *Data > Dark mode*. Both palettes live in `grid.py` as `LIGHT` and
-`DARK`; the one in force is `grid.C`. Read it as `grid.C` rather than
-`from grid import C`, which would snapshot the light palette at import time.
+The window chrome -- menus, toolbar, dialogs, scrollbars -- comes from
+**pyqtdarktheme**. The grid paints its own cells on top, from the palette in
+`grid.py` (`LIGHT` / `DARK`, with `grid.C` the one in force). Read it as
+`grid.C` rather than `from grid import C`, which would snapshot the light
+palette at import time.
+
+That the two compose is not an accident worth assuming: pyqtdarktheme's
+stylesheet contains `QAbstractItemView::item` rules, which is normally enough
+to make Qt take over item painting and drop every per-cell brush. Measured,
+the state colours come through unchanged, and a test samples real pixels to
+keep it that way.
+
+pyqtdarktheme is required, not optional -- the whole of `apply_theme` is four
+lines:
+
+```python
+qdarktheme.setup_theme(theme)                 # "auto" | "light" | "dark"
+dark = theme == "dark" or (theme == "auto" and bool(darkdetect.isDark()))
+set_theme(dark)                               # which grid palette to paint with
+return dark
+```
+
+`auto` follows the desktop through darkdetect rather than Qt's
+`colorScheme()`, which only exists from Qt 6.5 and so always answers "light"
+on 6.4.1. Override with `--theme light|dark`, or flip it live from
+*Data > Dark mode*.
 
 The selection works the way Excel's does: a neutral translucent wash laid over
 the cell rather than a coloured fill, so a selected cell still shows whether it
@@ -224,6 +299,11 @@ Qt reads `#RRGGBBAA` as `#AARRGGBB`.
   rather than dropped, so you see what you typed and get an error on that
   exact cell.
 * Filters apply to stored rows only; the staging block is always visible.
+* No pandas. The hot paths are dictionary and set lookups over a few thousand
+  rows; a DataFrame in the middle is slower. Copying the whole table is the
+  one bulk operation, and there the cost is producing the display text, which
+  pandas cannot help with -- its `to_csv` is slower than the `csv` module on
+  the same strings.
 * Rows are loaded eagerly into memory (400 rows here; fine into the tens of
   thousands). Past that, `Repository.load_rows` is the one function to swap
   for a paged or threaded load.
