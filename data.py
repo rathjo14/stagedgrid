@@ -33,7 +33,8 @@ import itertools
 import operator
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Optional
+from functools import cmp_to_key
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from sqlalchemy import delete, func, null, select, update
 from sqlalchemy.engine import Engine
@@ -54,6 +55,7 @@ from schema import (
     display,
     is_blank,
     make_engine,
+    sort_key,
     to_db,
 )
 
@@ -409,6 +411,110 @@ class FilterSet:
             self.filters.clear()
         else:
             self.filters.pop(key, None)
+
+
+# -------------------------------------------------- what the view consists of
+# Two questions -- does this row belong in the view, and where does it go --
+# asked identically whether the rows are all in memory or only a window of them
+# is. Defined once here so the merged mode cannot drift from the grid.
+
+
+def searchable_columns(spec: TableSpec) -> list[ColumnSpec]:
+    """The columns the quick-search box looks in."""
+    return [c for c in spec.columns if not c.is_pk and c.kind.filterable]
+
+
+class RowMatcher:
+    """Does this row belong in the view, given the filters and the search?
+
+    Judged on the values the row has *now*, not the ones the database holds --
+    editing a cell can move a row out of a filter, and it should disappear just
+    as it would have had it always read that way.
+    """
+
+    def __init__(
+        self,
+        spec: TableSpec,
+        lookups: Optional[Lookups] = None,
+        filters: Optional[FilterSet] = None,
+        search: str = "",
+    ) -> None:
+        self.spec = spec
+        self.lookups = lookups or Lookups()
+        self.needle = (search or "").casefold()
+        self.columns = searchable_columns(spec)
+        self.preds: list[tuple[str, Callable[[Any], bool]]] = []
+        for key in (filters.active_keys() if filters else ()):
+            col = spec.get(key)
+            flt = filters.get(key) if filters else None
+            if col is None or flt is None:
+                continue
+            self.preds.append((col.key, flt.predicate(col, self.lookups)))
+
+    #: Joins the searchable cells in the cached haystack. A needle can never
+    #: contain it, so a match cannot straddle two columns -- which keeps this
+    #: the same question SQL answers, where the search is a per-column LIKE.
+    SEPARATOR = "\x00"
+
+    def searched(self, row: Row) -> bool:
+        if not self.needle:
+            return True
+        haystack = row.search_text
+        if haystack is None:
+            haystack = row.search_text = self.SEPARATOR.join(
+                display(col, row.values.get(col.key), self.lookups)
+                for col in self.columns
+            ).casefold()
+        return self.needle in haystack
+
+    def __call__(self, row: Row) -> bool:
+        return all(
+            pred(row.values.get(key)) for key, pred in self.preds
+        ) and self.searched(row)
+
+
+def row_order_key(
+    spec: TableSpec,
+    lookups: Optional[Lookups],
+    sort_keys: Sequence[tuple[str, bool]],
+):
+    """Key function putting rows in the order the grid shows them.
+
+    A tuple key cannot express per-column directions, so this compares level
+    by level instead. The rules it encodes are the ones the SQL translation
+    also has to honour: blanks go last whichever way the column is sorted, and
+    anything still tied falls back to the primary key ascending, which is what
+    makes the order total and therefore stable across a refetch.
+    """
+    levels = [
+        (spec[key], descending)
+        for key, descending in sort_keys
+        if spec.get(key) is not None
+    ]
+    pk = spec.pk.key
+
+    def compare(a: Row, b: Row) -> int:
+        for col, descending in levels:
+            left, right = a.values.get(col.key), b.values.get(col.key)
+            left_blank, right_blank = is_blank(left), is_blank(right)
+            if left_blank != right_blank:
+                return 1 if left_blank else -1
+            if left_blank:
+                continue
+            one = sort_key(col, left, lookups)
+            two = sort_key(col, right, lookups)
+            if one != two:
+                return -1 if ((one < two) != descending) else 1
+        first, second = a.values.get(pk), b.values.get(pk)
+        if first == second:
+            return 0
+        if first is None:
+            return 1
+        if second is None:
+            return -1
+        return -1 if first < second else 1
+
+    return cmp_to_key(compare)
 
 
 # ---------------------------------------------------------------- validation
@@ -1083,15 +1189,61 @@ class Repository:
         with Session(self.engine) as s:
             return int(s.execute(stmt).scalar_one())
 
-    def natural_keys(self) -> dict[tuple, int]:
-        """Natural key -> pk straight from the database."""
+    def natural_keys(
+        self,
+        latest_version_only: bool = False,
+        version_id: Optional[int] = None,
+    ) -> dict[tuple, int]:
+        """Natural key -> pk straight from the database.
+
+        This is what validation needs to answer "does this key already exist?",
+        and it is the reason a windowed grid can still answer it: the key is a
+        few columns out of twenty-odd and carries no JSON, so at 10,000 rows
+        the index is about 1 MB against 35 MB for the rows themselves.
+        """
+        if not self.spec.key_columns:
+            return {}
         key_cols = [getattr(self.model, c.key) for c in self.spec.key_columns]
         pk_attr = getattr(self.model, self.spec.pk.key)
+        stmt = select(pk_attr, *key_cols)
+        version = self.version_column
+        if version is not None:
+            if version_id is None and latest_version_only:
+                newest = self.latest_version()
+                version_id = newest[0] if newest else None
+            if version_id is not None:
+                stmt = stmt.where(getattr(self.model, version.key) == version_id)
         out: dict[tuple, int] = {}
         with Session(self.engine) as s:
-            for pk, *key in s.execute(select(pk_attr, *key_cols)):
+            for pk, *key in s.execute(stmt):
                 out[tuple(_enum_name(v) for v in key)] = pk
         return out
+
+    def load_rows_by_pk(self, pks: Iterable[int]) -> list[Row]:
+        """Specific rows, wherever they are in the table.
+
+        A stored branch names the rows it changed by primary key, and in
+        merged mode the window almost certainly does not hold them, so they
+        are fetched directly before its changes are replayed.
+        """
+        wanted = [p for p in pks if p is not None]
+        if not wanted:
+            return []
+        keys = [c.key for c in self.spec.columns]
+        enum_keys = {c.key for c in self.spec.columns if c.kind is ColumnKind.ENUM}
+        pk_attr = getattr(self.model, self.spec.pk.key)
+        stmt = select(*(getattr(self.model, k) for k in keys)).where(
+            pk_attr.in_(tuple(wanted))
+        )
+        rows: list[Row] = []
+        with Session(self.engine) as s:
+            for record in s.execute(stmt):
+                values = dict(zip(keys, record))
+                for key in enum_keys:
+                    if values[key] is not None:
+                        values[key] = _enum_name(values[key])
+                rows.append(Row.from_db(values))
+        return rows
 
     def apply(self, changeset: ChangeSet, dry_run: bool = False) -> ApplyResult:
         """Deletes, then updates, then inserts, so a freed key can be reused.

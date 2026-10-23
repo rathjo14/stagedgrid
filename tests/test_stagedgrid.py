@@ -1623,3 +1623,669 @@ def test_a_filter_sql_cannot_express_says_so_instead_of_lying(qapp, repo):
     # the Python fallback really did apply the regex
     owners = [window.model.row_at(r).values["owner"] for r in range(window.model.rowCount())]
     assert owners and all(str(o).startswith("risk") for o in owners)
+
+
+RANK_VIEWS = [
+    ("no sort at all", dict()),
+    ("one string column", dict(sort=(("owner", False),))),
+    ("one float, descending", dict(sort=(("weight", True),))),
+    ("an enum", dict(sort=(("type", False),))),
+    ("a foreign key label", dict(sort=(("a_id", True),))),
+    ("three columns, mixed directions",
+     dict(sort=(("a_id", False), ("type", True), ("weight", False)))),
+    ("a column that is mostly blank", dict(sort=(("status_note", False),))),
+    ("blanks, descending", dict(sort=(("status_note", True),))),
+    ("sorted and filtered",
+     dict(sort=(("score", True),),
+          filters=[ColumnFilter(key="type", allowed=frozenset({"BASELINE"}))])),
+]
+
+
+@pytest.mark.parametrize("label,view", RANK_VIEWS, ids=[v[0] for v in RANK_VIEWS])
+def test_a_row_knows_where_it_belongs_without_fetching_the_table(qapp, repo, label, view):
+    """`rank` is the foundation of merging, so check it against the truth.
+
+    For every row in a view, the number of rows the query would place before it
+    must equal its own index in that view. If this is off by one anywhere, a
+    held row lands in the wrong place and the whole merged view is subtly wrong.
+    """
+    from sqlview import SqlView, ViewQuery
+
+    filters = FilterSet()
+    for flt in view.get("filters") or ():
+        filters.set(flt)
+    query = ViewQuery(sort=view.get("sort", ()), filters=filters)
+    sql = SqlView(repo.model, repo.spec, repo.load_lookups())
+
+    ordered = sql.rows(repo.engine, query)
+    assert len(ordered) >= 10, "too few rows for this to prove anything"
+
+    for position, row in enumerate(ordered):
+        assert sql.rank(repo.engine, query, row.values) == position, (
+            f"{label}: row {row.values[repo.spec.pk.key]} thinks it is at "
+            f"{sql.rank(repo.engine, query, row.values)}, really at {position}"
+        )
+
+
+def test_rank_is_right_for_values_that_are_not_in_the_table(qapp, repo):
+    """The real use: a row whose values were edited, so the table disagrees."""
+    from sqlview import SqlView, ViewQuery
+
+    sql = SqlView(repo.model, repo.spec, repo.load_lookups())
+    query = ViewQuery(sort=(("weight", False),))
+    ordered = sql.rows(repo.engine, query)
+    weights = [r.values["weight"] for r in ordered]
+
+    victim = dict(ordered[-1].values)          # last row, by weight
+    victim["weight"] = -1.0                    # edit it to sort first
+    assert sql.rank(repo.engine, query, victim) == 0
+
+    victim["weight"] = None                    # blank it: blanks sort last
+    blanks = sum(1 for w in weights if w is None)
+    filled = len(weights) - blanks
+    # it ranks among the blanks, after every filled row, by primary key
+    rank = sql.rank(repo.engine, query, victim)
+    assert rank >= filled
+    assert rank <= len(ordered)
+
+
+ORDER_CASES = [
+    ("nothing", ()),
+    ("one string", (("owner", False),)),
+    ("one string, descending", (("owner", True),)),
+    ("a float with blanks", (("weight", False),)),
+    ("a float with blanks, descending", (("weight", True),)),
+    ("an enum", (("type", False),)),
+    ("a foreign key label", (("a_id", False),)),
+    ("mixed directions over three columns",
+     (("a_id", False), ("type", True), ("weight", False))),
+    ("a mostly blank column then a full one",
+     (("status_note", True), ("score", False))),
+]
+
+
+@pytest.mark.parametrize("label,keys", ORDER_CASES, ids=[c[0] for c in ORDER_CASES])
+def test_the_shared_order_key_is_the_order_the_grid_shows(qapp, repo, label, keys):
+    """`row_order_key` has to be the same order as the model's own sort.
+
+    The merged view sorts held rows with it while the database sorts the rest,
+    so any disagreement puts a row in the wrong place.
+    """
+    from data import row_order_key
+
+    lookups = repo.load_lookups()
+    rows = repo.load_rows(latest_version_only=False)
+    model = StagedTableModel(repo.spec, lookups)
+    model.load(rows, lookups)
+    model.set_sort(list(keys))
+    pk = repo.spec.pk.key
+
+    from_model = [
+        model.row_at(r).values[pk]
+        for r in range(model.staged_count, model.rowCount())
+    ]
+    from_key = [
+        r.values[pk] for r in sorted(rows, key=row_order_key(repo.spec, lookups, keys))
+    ]
+    assert from_key == from_model
+
+
+def _edit(model, pk_value, key, value):
+    """Edit a stored row through the model, by primary key."""
+    row = next(r for r in model._db_rows if r.values[model.spec.pk.key] == pk_value)
+    model.apply_values([(row.uid, key, value)])
+    return row
+
+
+@pytest.mark.parametrize(
+    "label,sort,search,window",
+    [
+        ("unsorted, whole view", (), "", 10_000),
+        ("sorted by the edited column", (("weight", False),), "", 10_000),
+        ("sorted descending", (("weight", True),), "", 10_000),
+        ("sorted by something else", (("owner", False),), "", 10_000),
+        ("two columns", (("type", False), ("weight", True)), "", 10_000),
+        ("a narrow window", (("weight", False),), "", 7),
+        ("a window of one", (("weight", False),), "", 1),
+        ("while searching", (), "APAC", 10_000),
+    ],
+)
+def test_a_merged_window_equals_holding_every_row(qapp, repo, label, sort, search, window):
+    """The point of the whole exercise.
+
+    Hold every row and edit some; that is the truth. Then ask the database for
+    the same view with those rows excluded and merged back in, a window at a
+    time, and the sequence of primary keys must be identical.
+    """
+    from data import RowMatcher, row_order_key
+    from sqlview import MergedView, SqlView, ViewQuery
+
+    lookups = repo.load_lookups()
+    pk = repo.spec.pk.key
+    model = StagedTableModel(repo.spec, lookups)
+    model.load(repo.load_rows(latest_version_only=False), lookups)
+    model.set_show_deleted(True)       # so deleted rows stay inline, comparably
+
+    ordered = [model.row_at(r).values[pk] for r in range(model.staged_count, model.rowCount())]
+    victims = [ordered[0], ordered[len(ordered) // 2], ordered[-1]]
+
+    # edits that move rows: to the front, to the back, and out of the sort
+    _edit(model, victims[0], "weight", 0.999_999)
+    _edit(model, victims[1], "weight", None)            # blank: sorts last
+    _edit(model, victims[2], "weight", -5.0)            # sorts first
+    _edit(model, victims[0], "owner", "zzz-last")
+    deleted = _edit(model, ordered[1], "status_note", "about to go")
+    model.set_row_states({deleted.uid: RowState.DELETED})
+
+    if search:
+        model.set_quick_search(search)
+    model.set_sort(list(sort))
+    truth = [
+        model.row_at(r).values[pk]
+        for r in range(model.staged_count, model.rowCount())
+    ]
+
+    held = [r for r in model._db_rows if r.original is not None or r.state is not RowState.CLEAN]
+    assert len(held) >= 4, "the edits did not take"
+
+    merged = MergedView(
+        repo.engine,
+        SqlView(repo.model, repo.spec, lookups),
+        RowMatcher(repo.spec, lookups, model.filters, search),
+        row_order_key(repo.spec, lookups, sort),
+    )
+    merged.refresh(ViewQuery(sort=sort, filters=model.filters, search=search), held)
+
+    assert merged.count() == len(truth)
+    got = []
+    for offset in range(0, merged.count(), window):
+        got.extend(r.values[pk] for r in merged.slice(offset, window))
+    assert got == truth
+
+
+def test_the_key_index_matches_what_the_rows_would_have_said(qapp, repo):
+    """Validation holds keys instead of rows, so the two must agree exactly.
+
+    This is what lets a windowed grid still catch a typed key that already
+    exists somewhere it is not currently showing.
+    """
+    from_rows = existing_key_map(repo.spec, repo.load_rows())
+    from_db = repo.natural_keys(latest_version_only=True)
+    assert from_db == from_rows
+    # the whole version, not a window
+    assert len(from_db) == repo.count_rows() > 0
+
+    every = repo.natural_keys()
+    assert every == existing_key_map(repo.spec, repo.load_rows(latest_version_only=False))
+    assert len(every) > len(from_db), "the fixture has more than one version"
+
+
+def _collapse(rows, pk):
+    """Rows with deleted ones inline -> (visible pks, marks above each index)."""
+    visible, marks, pending = [], {}, []
+    for row in rows:
+        if row.state is RowState.DELETED:
+            pending.append(row.values[pk])
+            continue
+        if pending:
+            marks[len(visible)] = pending
+            pending = []
+        visible.append(row.values[pk])
+    return visible, marks, pending
+
+
+@pytest.mark.parametrize("window", [10_000, 9, 3, 1])
+def test_deleted_rows_keep_their_gutter_marks_through_a_window(qapp, repo, window):
+    """A deleted row holds its place in the order but is not a row the grid
+    counts, so the merged view has to reconcile the two numberings."""
+    from data import RowMatcher, row_order_key
+    from sqlview import MergedView, SqlView, ViewQuery
+
+    lookups = repo.load_lookups()
+    pk = repo.spec.pk.key
+    model = StagedTableModel(repo.spec, lookups)
+    model.load(repo.load_rows(latest_version_only=False), lookups)
+    sort = (("weight", False),)
+    model.set_sort(list(sort))
+
+    ordered = [model.row_at(r).values[pk] for r in range(model.staged_count, model.rowCount())]
+    # a run of two adjacent deletions, one alone, and one at the very end
+    doomed = [ordered[2], ordered[3], ordered[6], ordered[-1]]
+    states = {}
+    for value in doomed:
+        row = next(r for r in model._db_rows if r.values[pk] == value)
+        states[row.uid] = RowState.DELETED
+    model.set_row_states(states)
+
+    truth = [model.row_at(r).values[pk] for r in range(model.staged_count, model.rowCount())]
+    truth_marks = {
+        r - model.staged_count: [x.values[pk] for x in model.deleted_rows_above(r)]
+        for r in range(model.staged_count, model.rowCount())
+        if model.deleted_rows_above(r)
+    }
+    assert truth_marks, "the deletions did not produce marks"
+    assert model.has_trailing_deleted()
+
+    held = [r for r in model._db_rows if r.original is not None or r.state is not RowState.CLEAN]
+    merged = MergedView(
+        repo.engine,
+        SqlView(repo.model, repo.spec, lookups),
+        RowMatcher(repo.spec, lookups, model.filters, ""),
+        row_order_key(repo.spec, lookups, sort),
+    )
+    merged.refresh(ViewQuery(sort=sort, filters=model.filters), held)
+
+    assert merged.visible_count() == len(truth)
+    assert merged.count() == len(truth) + len(doomed)
+
+    got, marks, trailing = [], {}, []
+    for offset in range(0, merged.visible_count(), window):
+        rows = merged.visible_slice(offset, window)
+        seen, local, tail = _collapse(rows, pk)
+        for at, pks in local.items():
+            marks[len(got) + at] = pks
+        got.extend(seen)
+        trailing = tail
+    assert got == truth
+    assert marks == truth_marks
+    assert trailing == [doomed[-1]]      # the last row, with nothing after it
+
+
+# ------------------------------------------------- the model in merged mode
+def _merged(repo, sort=(), search="", filters=None, show_deleted=False):
+    """A model whose view comes from the database, with a window resident."""
+    from data import RowMatcher, row_order_key
+    from sqlview import MergedView, SqlView, ViewQuery
+
+    lookups = repo.load_lookups()
+    model = StagedTableModel(repo.spec, lookups)
+    if filters is not None:
+        model.filters = filters
+    source = MergedView(
+        repo.engine,
+        SqlView(repo.model, repo.spec, lookups),
+        RowMatcher(repo.spec, lookups, model.filters, search),
+        row_order_key(repo.spec, lookups, sort),
+    )
+    model.load([], lookups)
+    model.validator.set_existing_keys(repo.natural_keys())
+    model.set_window_source(source)
+    query = ViewQuery(sort=sort, filters=model.filters, search=search)
+
+    def fetch(at, size):
+        source.refresh(query, model._stored_rows(), show_deleted)
+        model.load_window(source.visible_slice(at, size), at)
+
+    fetch(0, 5)
+    return model, source, fetch
+
+
+def test_merged_mode_counts_the_table_while_holding_a_window(qapp, repo):
+    model, source, _ = _merged(repo, sort=(("weight", False),))
+    total = repo.count_rows(latest_version_only=False)
+
+    assert source.visible_count() == total
+    assert model.rowCount() == model.staged_count + total   # the scrollbar is right
+    assert len(model._db_rows) == 5                         # but only five are here
+
+    assert model.row_at(model.staged_count) is not None     # inside the window
+    assert model.row_at(model.staged_count + 4) is not None
+    assert model.row_at(model.staged_count + 5) is None     # outside it
+    # Qt asks for cells it cannot have; it must get nothing, not a crash
+    assert model.data(model.index(model.staged_count + 5, 0)) is None
+
+
+def test_merged_mode_scrolls_to_rows_it_never_held(qapp, repo):
+    model, source, fetch = _merged(repo, sort=(("weight", True),))
+    total = source.visible_count()
+
+    everything = [
+        r.values["weight"]
+        for r in repo.load_rows(latest_version_only=False)
+    ]
+    top = model.row_at(model.staged_count).values["weight"]
+    assert top == max(w for w in everything if w is not None)
+
+    fetch(total - 3, 3)                                     # jump to the end
+    assert model.row_at(model.staged_count + total - 1) is not None
+    assert model.row_at(model.staged_count) is None         # the top is gone now
+    last = model.row_at(model.staged_count + total - 1).values["weight"]
+    filled = [w for w in everything if w is not None]
+    assert last is None or last == min(filled)
+
+
+def test_an_edit_survives_scrolling_away_from_it(qapp, repo):
+    """The invariant the whole design rests on.
+
+    A row the user touched is held, so it keeps its uid, its original values
+    and its place in the changeset even when the window has moved past it.
+    """
+    model, source, fetch = _merged(repo, sort=(("weight", False),))
+    total = source.visible_count()
+
+    victim = model.row_at(model.staged_count)
+    uid, pk = victim.uid, victim.values[repo.spec.pk.key]
+    model.apply_values([(uid, "owner", "edited-in-session")])
+    assert model.dirty_counts()["updates"] == 1
+
+    fetch(total - 2, 2)                                     # scroll far away
+    assert model.row_at(model.staged_count) is None          # not resident
+
+    assert model.row_by_uid(uid) is not None                 # still addressable
+    assert model.dirty_counts()["updates"] == 1              # still pending
+    ops = model.changeset().operations
+    assert [o.pk for o in ops if o.kind == "update"] == [pk]
+    assert model.row_by_uid(uid).original is not None         # and undoable
+
+    fetch(0, 5)                                               # come back
+    again = model.row_at(model.staged_count)
+    assert again.uid == uid                                   # the same object
+    assert again.values["owner"] == "edited-in-session"
+
+
+def test_an_edit_that_moves_a_row_moves_it(qapp, repo):
+    """The database still holds the old value, so the merge has to override it."""
+    model, source, fetch = _merged(repo, sort=(("weight", False),))
+    total = source.visible_count()
+
+    victim = model.row_at(model.staged_count + 1)
+    uid = victim.uid
+    model.apply_values([(uid, "weight", 99.0)])               # should go last
+    fetch(0, 5)
+    assert model.row_at(model.staged_count + 1).uid != uid
+
+    fetch(total - 1, 1)
+    assert model.row_at(model.staged_count + total - 1).uid == uid
+
+
+def test_merged_mode_validates_against_the_whole_version_not_the_window(qapp, repo):
+    """Typing a key that exists outside the window must still be caught."""
+    model, source, fetch = _merged(repo)
+    spec = repo.spec
+
+    far = repo.load_rows(latest_version_only=False)[-1]
+    assert not any(
+        r.values[spec.pk.key] == far.values[spec.pk.key] for r in model._db_rows
+    ), "pick a row the window does not hold"
+
+    placeholder = model.staged_count - 1
+    for col in spec.key_columns:
+        text = display(col, far.values[col.key], model.lookups)
+        model.setData(model.index(placeholder, model.column_index(col.key)), text)
+
+    staged = model.row_at(0)
+    assert staged.errors, "a duplicate of an unseen row was not caught"
+    assert any("exist" in m.lower() or "duplicate" in m.lower()
+               for m in staged.errors.values())
+
+
+def test_merged_mode_keeps_delete_marks_and_the_commit_state(qapp, repo):
+    model, source, fetch = _merged(repo, sort=(("weight", False),))
+
+    doomed = model.row_at(model.staged_count + 1)
+    model.set_row_states({doomed.uid: RowState.DELETED})
+    fetch(0, 5)
+
+    assert model.dirty_counts()["deletes"] == 1
+    # it left the view and became a mark on the row that followed it
+    assert doomed.uid not in {model.row_at(model.staged_count + i).uid
+                              for i in range(3)}
+    marks = [
+        model.deleted_rows_above(r)
+        for r in range(model.staged_count, model.rowCount())
+    ]
+    assert any(doomed.uid in {x.uid for x in m} for m in marks)
+
+
+# ------------------------------------------------ the window in merged mode
+@pytest.fixture
+def merged_window(qapp, repo):
+    """A window whose view the database computes, holding six rows.
+
+    Not closed on the way out, like the `window` fixture: closing asks about
+    pending changes, and an offscreen test can never answer.
+    """
+    from app import MainWindow
+
+    window = MainWindow(repo, merged=True)
+    window.window_size = 6
+    window._refresh_window(0, structural=True)
+    return window
+
+
+def test_the_merged_window_shows_a_table_it_is_not_holding(merged_window, repo):
+    window = merged_window
+    total = repo.count_rows()
+
+    assert window.merged
+    assert window.model.rowCount() == window.model.staged_count + total
+    assert window.model.resident_rows() == 6 < total
+    assert window.model.staged_count == 1          # you can still type
+    assert window.action_commit.isVisible()
+
+
+def test_scrolling_fetches_without_losing_the_selection(merged_window, repo):
+    """A model reset would drop both the selection and the scroll position,
+    and dropping the scroll position mid-scroll makes the grid undrivable."""
+    window = merged_window
+    model = window.model
+    view = window.view
+
+    pk = repo.spec.pk.key
+    first = model.staged_count
+    view.selectRow(first)
+    was = model.row_at(first)
+    picked, picked_uid = was.values[pk], was.uid
+    resets = []
+    model.modelAboutToBeReset.connect(lambda: resets.append(1))
+
+    window._refresh_window(4)                       # slide the window along
+    assert model.window_at == 4
+    assert not resets, "scrolling reset the model"
+    assert view.selectionModel().isSelected(model.index(first, 0))
+
+    # the row that was on screen is no longer resident, and says so
+    assert model.row_at(first) is None
+
+    window._refresh_window(0)
+    back = model.row_at(first)
+    assert back.values[pk] == picked         # the same database row
+    assert back.uid != picked_uid            # but deliberately not the same object
+    # Which is safe precisely because it was clean. An edited row is held, and
+    # test_an_edit_survives_scrolling_away_from_it pins that it keeps its uid.
+    assert back.original is None and back.state is RowState.CLEAN
+
+
+def test_an_edit_commits_after_scrolling_past_it(merged_window, repo):
+    window = merged_window
+    model = window.model
+    pk = repo.spec.pk.key
+
+    target = model.row_at(model.staged_count)
+    uid, pk_value = target.uid, target.values[pk]
+    model.setData(
+        model.index(model.staged_count, model.column_index("owner")),
+        "merged-edit",
+    )
+    assert model.dirty_counts()["updates"] == 1
+
+    total = repo.count_rows()
+    window._refresh_window(max(0, total - 3))
+    assert model.row_at(model.staged_count) is None       # scrolled past it
+
+    changes = window.model.changeset()
+    updates = [o for o in changes.operations if o.kind == "update"]
+    assert [o.pk for o in updates] == [pk_value]
+    assert updates[0].values_text.get("owner") == "merged-edit" or any(
+        c.column == "owner" for c in updates[0].changes
+    )
+    assert window.unsaved_changes()
+    assert model.row_by_uid(uid) is not None
+
+
+def test_the_filter_checklist_covers_the_table_not_the_window(merged_window, repo):
+    """A checklist of whatever happens to be on screen is worse than useless."""
+    window = merged_window
+    model = window.model
+    column = model.column_index("a_id")
+
+    offered = dict(model.distinct_values(column))
+    resident = {
+        display(model.columns[column], r.values.get("a_id"), model.lookups)
+        for r in model._db_rows
+    }
+    assert len(offered) > len(resident), "the checklist only saw the window"
+
+    everything = {}
+    for row in repo.load_rows():
+        text = display(model.columns[column], row.values.get("a_id"), model.lookups)
+        everything[text] = everything.get(text, 0) + 1
+    assert offered == everything
+
+
+def test_an_edited_value_shows_up_in_the_checklist(merged_window, repo):
+    """Held rows are excluded from every query, so they are counted here."""
+    window = merged_window
+    model = window.model
+    column = model.column_index("owner")
+
+    before = dict(model.distinct_values(column))
+    model.setData(
+        model.index(model.staged_count, column), "a-name-nobody-else-has"
+    )
+    window._refresh_window(0)
+    after = dict(model.distinct_values(column))
+
+    assert "a-name-nobody-else-has" not in before
+    assert after.get("a-name-nobody-else-has") == 1
+    assert sum(after.values()) == sum(before.values())   # nothing double-counted
+
+
+def test_sorting_in_merged_mode_covers_rows_it_is_not_holding(merged_window, repo):
+    window = merged_window
+    model = window.model
+
+    model.set_sort([("weight", True)])
+    window._reload_view()
+    everything = [r.values["weight"] for r in repo.load_rows()]
+    assert model.row_at(model.staged_count).values["weight"] == max(
+        w for w in everything if w is not None
+    )
+
+
+def test_the_toggle_switches_modes_both_ways(qapp, repo):
+    from app import MainWindow
+
+    window = MainWindow(repo)
+    assert not window.merged
+    held_everything = window.model.resident_rows()
+
+    window.set_merged(True)
+    assert window.merged
+    assert window.model.windowed
+    assert window.model.resident_rows() <= window.window_size
+
+    window.set_merged(False)
+    assert not window.merged
+    assert not window.model.windowed
+    assert window.model.resident_rows() == held_everything
+
+
+# ------------------------------------------ what the windowing audit caught
+def test_deleting_a_selection_reaches_past_the_window(merged_window, repo):
+    """Select-all and delete must not quietly delete only what is on screen."""
+    window = merged_window
+    model = window.model
+    total = repo.count_rows()
+    assert model.resident_rows() < total, "the window has to be smaller"
+
+    everything = range(model.staged_count, model.staged_count + total)
+    model.delete_rows(everything)
+
+    assert model.dirty_counts()["deletes"] == total
+    deletes = [o for o in model.changeset().operations if o.kind == "delete"]
+    assert len(deletes) == total
+    assert len({o.pk for o in deletes}) == total      # each one once
+
+    window._refresh_window(0, structural=True)
+    assert model.rowCount() == model.staged_count     # nothing visible but staging
+
+
+def test_copying_a_selection_reaches_past_the_window(merged_window, repo):
+    """The same gap, read-only: copy used to skip rows it could not see."""
+    window = merged_window
+    view = window.view
+    total = repo.count_rows()
+
+    view.selectAll()
+    view.copy_selection()
+    text = QApplication.clipboard().text()
+    lines = [line for line in text.split("\r\n") if line.strip()]
+    # every stored row, plus nothing for the empty staging row
+    assert len(lines) == total, f"copied {len(lines)} of {total}"
+
+
+def test_reverting_a_selection_reaches_past_the_window(merged_window, repo):
+    window = merged_window
+    model = window.model
+    total = repo.count_rows()
+
+    model.delete_rows(range(model.staged_count, model.staged_count + total))
+    assert model.dirty_counts()["deletes"] == total
+
+    model.set_show_deleted(True)
+    window._refresh_window(0, structural=True)
+    model.revert_rows(range(model.staged_count, model.staged_count + total))
+    assert model.dirty_counts()["deletes"] == 0
+    assert not model.changeset().operations
+
+
+def test_a_search_does_not_match_across_a_column_boundary(qapp, repo):
+    """In SQL the search is a per-column LIKE, so the in-memory one must be too
+    -- otherwise the same needle means different things in the two modes."""
+    from data import RowMatcher
+
+    lookups = repo.load_lookups()
+    rows = repo.load_rows(latest_version_only=False)
+    spec = repo.spec
+
+    row = rows[0]
+    columns = [c for c in spec.columns if not c.is_pk and c.kind.filterable]
+    pair = [display(c, row.values.get(c.key), lookups) for c in columns[:2]]
+    straddling = (pair[0][-2:] + pair[1][:2]).casefold()
+    assert len(straddling) >= 3, "need two non-empty neighbouring cells"
+
+    row.search_text = None
+    assert not RowMatcher(spec, lookups, None, straddling)(row)
+    # and each half on its own still matches
+    row.search_text = None
+    assert RowMatcher(spec, lookups, None, pair[0])(row)
+
+
+def test_a_wildcard_typed_into_the_search_box_is_literal(qapp, repo):
+    """%% in a LIKE pattern matches everything, which is not what was typed."""
+    from sqlview import SqlView, ViewQuery
+
+    sql = SqlView(repo.model, repo.spec, repo.load_lookups())
+    assert sql.count(repo.engine, ViewQuery(search="%")) == 0
+    assert sql.count(repo.engine, ViewQuery(search="_")) == 0
+    # and a real needle still works
+    assert sql.count(repo.engine, ViewQuery(search="RATES")) > 0
+
+
+def test_showing_deleted_rows_refreshes_a_windowed_view(merged_window, repo):
+    """It changes what the view consists of, so merged mode has to re-ask."""
+    window = merged_window
+    model = window.model
+
+    doomed = model.row_at(model.staged_count)
+    model.set_row_states({doomed.uid: RowState.DELETED})
+    window._refresh_window(0, structural=True)
+    hidden_total = model.rowCount()
+
+    model.set_show_deleted(True)        # emits viewChanged -> _reload_view
+    assert model.rowCount() == hidden_total + 1
+    assert model.row_at(model.staged_count).uid == doomed.uid
+
+    model.set_show_deleted(False)
+    assert model.rowCount() == hidden_total

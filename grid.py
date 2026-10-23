@@ -62,6 +62,7 @@ from data import (
     ColumnFilter,
     FilterSet,
     Row,
+    RowMatcher,
     RowState,
     Validator,
     existing_key_map,
@@ -252,6 +253,11 @@ CELL_UPDATED = "updated"
 INT_RE = r"^-?\d*$"
 
 
+def _is_pending(row: Row) -> bool:
+    """Does this stored row differ from what the database holds?"""
+    return bool(row.changed_keys()) or row.state is not RowState.CLEAN
+
+
 class StagedTableModel(QAbstractTableModel):
     """Staged inserts pinned above the rows loaded from the database."""
 
@@ -299,6 +305,16 @@ class StagedTableModel(QAbstractTableModel):
         self._quick_search = ""
         self._show_deleted = False
         self._by_uid: dict[int, Row] = {}
+        #: Set in merged mode: a sqlview.MergedView that does the ordering,
+        #: filtering and searching in the database and says where the rows we
+        #: hold belong. None means every stored row is here in memory.
+        self._window = None
+        self._window_at = 0        # visible row the resident slice starts at
+        #: Stored rows this session has touched, by uid. In merged mode these
+        #: are kept whatever the window is showing -- they are the rows whose
+        #: values the database disagrees with, and the only ones anything
+        #: points at. Empty when every row is in memory anyway.
+        self._held: dict[int, Row] = {}
 
     # ------------------------------------------------------------------ data
     def load(self, rows: Sequence[Row], lookups: Optional[Lookups] = None) -> None:
@@ -345,7 +361,114 @@ class StagedTableModel(QAbstractTableModel):
 
     def _reindex(self) -> None:
         self._by_uid = {r.uid: r for r in self._db_rows}
+        if self._window is not None:
+            # Rows this session has edited stay addressable after scrolling
+            # away from them, because undo and the changeset still point at
+            # them. Clean rows are the ones nothing points at, which is exactly
+            # why they are the ones safe to drop and refetch.
+            self._by_uid.update(self._held)
         self._by_uid.update({r.uid: r for r in self._staged})
+
+    # ------------------------------------------------------ merged windowing
+    @property
+    def windowed(self) -> bool:
+        """Is the database computing the view, with only a window resident?"""
+        return self._window is not None
+
+    def set_window_source(self, source) -> None:
+        """Hand ordering, filtering and searching to the database.
+
+        ``source`` is a :class:`sqlview.MergedView`. Once set, the model stops
+        computing the view itself: ``rowCount`` becomes the count the database
+        reports, and the rows it holds are whatever window was last fetched.
+        """
+        self._window = source
+        self._window_at = 0
+        if source is None:
+            # Back to holding everything: the held set was only ever a stand-in
+            # for rows that were not resident, and now they all will be.
+            self._held.clear()
+
+    def load_window(
+        self, rows: Sequence[Row], at: int, structural: bool = False
+    ) -> None:
+        """Show the slice of the view starting at visible row ``at``.
+
+        Unlike :meth:`load` this keeps the staging block, the undo stack and
+        the pending changes: it is a scroll, not a reload.
+
+        ``structural`` says whether the shape of the view changed as well as
+        its contents -- a new sort or filter did, a scroll did not. A scroll
+        must not reset the model, because a reset drops the selection and the
+        scroll position, and dropping the scroll position mid-scroll makes the
+        grid impossible to drive.
+        """
+        was_lo = self._window_at
+        was_hi = was_lo + len(self._view)
+        if structural:
+            self.beginResetModel()
+        self._db_rows = list(rows)
+        self._window_at = max(0, at)
+        self._reindex()
+        self._rebuild_order()
+        if structural:
+            self.endResetModel()
+            return
+        lo = min(was_lo, self._window_at)
+        hi = max(was_hi, self._window_at + len(self._view))
+        if hi > lo:
+            top = len(self._staged) + lo
+            bottom = len(self._staged) + hi - 1
+            self.dataChanged.emit(
+                self.index(top, 0), self.index(bottom, self.columnCount() - 1)
+            )
+            self.headerDataChanged.emit(Qt.Orientation.Vertical, top, bottom)
+
+    def seed_held(self, rows: Sequence[Row]) -> None:
+        """Put rows into the held set before anything edits them.
+
+        Replaying a stored branch names rows by primary key the current window
+        may not contain, so they are fetched and handed over first.
+        """
+        if self._window is None:
+            return
+        for row in rows:
+            self._held.setdefault(row.uid, row)
+        self._reindex()
+
+    def held_rows(self) -> list[Row]:
+        """The stored rows the database disagrees with, for the window source."""
+        return list(self._held.values())
+
+    def _note_held(self) -> None:
+        """Keep the held set in step with what is actually pending.
+
+        A row joins it the moment it is edited or marked deleted and leaves it
+        when it is reverted, so it holds exactly the rows whose values differ
+        from the table's -- no more, because every one of them costs a count
+        query when the view is rebuilt.
+        """
+        if self._window is None:
+            return
+        for row in self._db_rows:
+            if _is_pending(row):
+                self._held[row.uid] = row
+        for uid, row in list(self._held.items()):
+            if not _is_pending(row):
+                # Reverted: the database agrees with us again, so let it go.
+                del self._held[uid]
+
+    def _stored_rows(self) -> list[Row]:
+        """Every stored row this session has an opinion about.
+
+        In memory that is all of them. In merged mode it is the held ones --
+        the same thing for every purpose that asks, because a row nobody has
+        touched has no pending change, nothing to validate and nothing to
+        commit.
+        """
+        if self._window is not None:
+            return self.held_rows()
+        return self._db_rows
 
     # -------------------------------------------------------------- geometry
     @property
@@ -355,6 +478,8 @@ class StagedTableModel(QAbstractTableModel):
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
             return 0
+        if self._window is not None:
+            return len(self._staged) + self._window.visible_count()
         return len(self._staged) + len(self._view)
 
     def column_index(self, key: str) -> int:
@@ -377,10 +502,10 @@ class StagedTableModel(QAbstractTableModel):
             return None
         if visual_row < len(self._staged):
             return self._staged[visual_row]
-        offset = visual_row - len(self._staged)
-        if offset < len(self._view):
+        offset = visual_row - len(self._staged) - self._window_at
+        if 0 <= offset < len(self._view):
             return self._db_rows[self._view[offset]]
-        return None
+        return None        # outside the resident window, in merged mode
 
     def visual_row_of(self, uid: int) -> int:
         for i, row in enumerate(self._staged):
@@ -388,7 +513,7 @@ class StagedTableModel(QAbstractTableModel):
                 return i
         for offset, db_index in enumerate(self._view):
             if self._db_rows[db_index].uid == uid:
-                return len(self._staged) + offset
+                return len(self._staged) + self._window_at + offset
         return -1
 
     # ----------------------------------------------------------------- roles
@@ -603,6 +728,7 @@ class StagedTableModel(QAbstractTableModel):
             row = self._by_uid[uid]
             row.search_text = None          # its text changed
             row.recompute_state()
+        self._note_held()
         self._normalise_staging()
         self.revalidate()
         for uid in touched:
@@ -653,6 +779,7 @@ class StagedTableModel(QAbstractTableModel):
                 row.state = RowState.UPDATED if row.changed_keys() else RowState.CLEAN
             else:
                 row.state = state
+        self._note_held()
         self._rebuild_order()
         self.revalidate(emit=False)
         self.endResetModel()
@@ -691,9 +818,51 @@ class StagedTableModel(QAbstractTableModel):
             StagingCommand(self, before, after, f"add {count} staged row(s)")
         )
 
+    def rows_for(self, visual_rows: Iterable[int], for_edit: bool = False) -> list[Row]:
+        """The rows at these visual positions, fetching any not resident.
+
+        A selection reaches wherever the user dragged it, and in merged mode
+        that is routinely past the window. Acting on only the part that happens
+        to be in memory would quietly do less than was asked -- so the rest is
+        fetched, in one query per run of adjacent rows.
+
+        ``for_edit`` puts what comes back into the held set, because a row
+        about to be deleted has to survive the next window move.
+        """
+        wanted = sorted(set(visual_rows))
+        out: list[Row] = []
+        missing: list[int] = []
+        for visual in wanted:
+            row = self.row_at(visual)
+            if row is None:
+                missing.append(visual)
+            else:
+                out.append(row)
+        if not missing or self._window is None:
+            return out
+
+        runs: list[tuple[int, int]] = []
+        start = previous = missing[0]
+        for visual in missing[1:]:
+            if visual == previous + 1:
+                previous = visual
+                continue
+            runs.append((start, previous))
+            start = previous = visual
+        runs.append((start, previous))
+
+        fetched: list[Row] = []
+        for low, high in runs:
+            at = low - len(self._staged)
+            fetched.extend(self._window.visible_slice(at, high - low + 1))
+        if for_edit:
+            self.seed_held(fetched)
+        out.extend(fetched)
+        return out
+
     def delete_rows(self, visual_rows: Iterable[int]) -> None:
         """Mark existing rows deleted; drop staged rows outright."""
-        rows = [self.row_at(r) for r in sorted(set(visual_rows))]
+        rows = self.rows_for(visual_rows, for_edit=True)
         rows = [r for r in rows if r is not None]
         staged = [r for r in rows if r.is_staged and not r.is_empty(self.spec)]
         existing = [r for r in rows if not r.is_staged and r.state is not RowState.DELETED]
@@ -723,8 +892,7 @@ class StagedTableModel(QAbstractTableModel):
         """Undo pending edits on existing rows (and un-delete them)."""
         changes: list[tuple[int, str, Any]] = []
         undelete: list[int] = []
-        for visual in sorted(set(visual_rows)):
-            row = self.row_at(visual)
+        for row in self.rows_for(visual_rows, for_edit=True):
             if row is None or row.is_staged:
                 continue
             if row.state is RowState.DELETED:
@@ -807,6 +975,19 @@ class StagedTableModel(QAbstractTableModel):
     def quick_search(self) -> str:
         return self._quick_search
 
+    @property
+    def showing_deleted(self) -> bool:
+        return self._show_deleted
+
+    @property
+    def window_at(self) -> int:
+        """Visible row the resident slice starts at (0 unless windowed)."""
+        return self._window_at
+
+    def resident_rows(self) -> int:
+        """How many rows are actually in memory, window or not."""
+        return len(self._db_rows)
+
     def set_show_deleted(self, show: bool) -> None:
         if show == self._show_deleted:
             return
@@ -814,34 +995,23 @@ class StagedTableModel(QAbstractTableModel):
         self._show_deleted = show
         self._rebuild_order()
         self.endResetModel()
+        # It changes which rows the view consists of, so in merged mode the
+        # window has to be asked for again -- the same as a sort or a filter.
+        self.viewChanged.emit()
 
     def _rebuild_order(self) -> None:
-        preds = []
-        for key in self.filters.active_keys():
-            col = self.spec.get(key)
-            flt = self.filters.get(key)
-            if col is None or flt is None:
-                continue
-            preds.append((col.key, flt.predicate(col, self.lookups)))
-
-        needle = self._quick_search.casefold()
-        searchable = [c for c in self.columns if c.kind.filterable]
-
-        def matches_search(row: Row) -> bool:
-            if not needle:
-                return True
-            haystack = row.search_text
-            if haystack is None:
-                haystack = row.search_text = "".join(
-                    display(col, row.values.get(col.key), self.lookups)
-                    for col in searchable
-                ).casefold()
-            return needle in haystack
-
-        order = []
-        for i, row in enumerate(self._db_rows):
-            if all(pred(row.values.get(key)) for key, pred in preds) and matches_search(row):
-                order.append(i)
+        if self._window is not None:
+            # The database already ordered, filtered and searched this slice.
+            # All that is left is the thing SQL cannot express: collapsing rows
+            # deleted in this session into a mark above the row below them.
+            self._view, self._marks, self._trailing_marks = self._collapse_deleted(
+                range(len(self._db_rows))
+            )
+            return
+        # The same matcher merged mode judges held rows with, so the two
+        # modes cannot drift on what a filter or a search means.
+        keep = RowMatcher(self.spec, self.lookups, self.filters, self._quick_search)
+        order = [i for i, row in enumerate(self._db_rows) if keep(row)]
 
         for key, descending in reversed(self._sort_keys):
             col = self.spec.get(key)
@@ -855,11 +1025,12 @@ class StagedTableModel(QAbstractTableModel):
             )
             order = filled + blanks
 
-        if self._show_deleted:
-            self._view = list(order)
-            self._marks, self._trailing_marks = {}, []
-            return
+        self._view, self._marks, self._trailing_marks = self._collapse_deleted(order)
 
+    def _collapse_deleted(self, order) -> tuple:
+        """Deleted rows leave the view and become a mark on the row below."""
+        if self._show_deleted:
+            return list(order), {}, []
         view: list[int] = []
         marks: dict[int, list[int]] = {}
         pending: list[int] = []
@@ -871,17 +1042,21 @@ class StagedTableModel(QAbstractTableModel):
                 marks[len(view)] = pending
                 pending = []
             view.append(i)
-        self._view = view
-        self._marks = marks
-        self._trailing_marks = pending
+        return view, marks, pending
 
     def deleted_above(self, visual_row: int) -> list[int]:
         """Database-row indices deleted immediately above this visual row."""
-        offset = visual_row - len(self._staged)
+        offset = visual_row - len(self._staged) - self._window_at
         if offset < 0:
             return []
         if offset >= len(self._view):
-            return list(self._trailing_marks)
+            # Past the resident slice there is only something to say when the
+            # slice runs to the end of the view.
+            at_end = (
+                self._window is None
+                or self._window_at + len(self._view) >= self._window.visible_count()
+            )
+            return list(self._trailing_marks) if at_end else []
         return list(self._marks.get(offset, ()))
 
     def deleted_rows_above(self, visual_row: int) -> list[Row]:
@@ -897,6 +1072,15 @@ class StagedTableModel(QAbstractTableModel):
         does, and ignoring rows deleted in this session.
         """
         col = self.columns[column]
+        if self._window is not None:
+            # Only a window is here, so the counts have to come from the
+            # database -- a checklist of what happens to be on screen would be
+            # worse than useless.
+            counts = self._window.distinct(
+                col, self.filters, self.lookups, self.held_rows()
+            )
+            return sorted(counts.items(), key=lambda kv: _distinct_key(col, kv[0]))
+
         preds = []
         for key in self.filters.active_keys():
             if key == col.key:
@@ -907,7 +1091,7 @@ class StagedTableModel(QAbstractTableModel):
                 continue
             preds.append((other.key, flt.predicate(other, self.lookups)))
 
-        counts: dict[str, int] = {}
+        counts = {}
         for row in self._db_rows:
             if row.state is RowState.DELETED:
                 continue
@@ -919,7 +1103,7 @@ class StagedTableModel(QAbstractTableModel):
 
     # ------------------------------------------------------------ validation
     def revalidate(self, emit: bool = True) -> None:
-        self.validator.validate([*self._staged, *self._db_rows])
+        self.validator.validate([*self._staged, *self._stored_rows()])
         if emit and self.rowCount():
             self.dataChanged.emit(
                 self.index(0, 0),
@@ -927,7 +1111,7 @@ class StagedTableModel(QAbstractTableModel):
             )
 
     def validation_report(self):
-        return self.validator.validate([*self._staged, *self._db_rows])
+        return self.validator.validate([*self._staged, *self._stored_rows()])
 
     # ------------------------------------------------------------- changeset
     def replay(self, payload: Optional[dict]) -> dict[str, int]:
@@ -946,7 +1130,8 @@ class StagedTableModel(QAbstractTableModel):
         if not isinstance(operations, (list, tuple)) or not operations:
             return counts
 
-        by_pk = {r.values.get(self.spec.pk.key): r for r in self._db_rows}
+        by_pk = {r.values.get(self.spec.pk.key): r for r in self._stored_rows()}
+        by_pk.update({r.values.get(self.spec.pk.key): r for r in self._db_rows})
         staged: list[Row] = []
         for op in operations:
             if not isinstance(op, dict):
@@ -993,7 +1178,7 @@ class StagedTableModel(QAbstractTableModel):
 
     def changeset(self) -> ChangeSet:
         return ChangeSet.from_rows(
-            self.spec, [*self._staged, *self._db_rows], self.lookups
+            self.spec, [*self._staged, *self._stored_rows()], self.lookups
         )
 
     def dirty_counts(self) -> dict[str, int]:
@@ -1003,7 +1188,7 @@ class StagedTableModel(QAbstractTableModel):
                 counts["inserts"] += 1
             if row.errors:
                 counts["errors"] += 1
-        for row in self._db_rows:
+        for row in self._stored_rows():
             if row.state is RowState.UPDATED:
                 counts["updates"] += 1
             elif row.state is RowState.DELETED:
@@ -1672,6 +1857,9 @@ class GridView(QTableView):
         numbers: list[float] = []
         filled = 0
         cells = 0
+        # Deliberately not rows_for: this runs on every selection change, and
+        # a query per mouse drag is not worth a status-bar total. In merged
+        # mode it therefore covers the rows on screen.
         for visual in rows:
             row = model.row_at(visual)
             if row is None:
@@ -1808,8 +1996,9 @@ class GridView(QTableView):
         writer = csv.writer(buffer, delimiter="\t", lineterminator="\r\n")
         if with_headers:
             writer.writerow([c.header for c in specs])
-        for visual in rows:
-            row = model.row_at(visual)
+        # rows_for, not row_at: a copy that silently left out the rows the
+        # window had not reached would be worse than a slow one.
+        for row in model.rows_for(rows):
             if row is None:
                 continue
             values = row.values
