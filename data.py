@@ -1113,7 +1113,6 @@ class Repository:
         limit: Optional[int] = None,
         latest_version_only: bool = True,
         version_id: Optional[int] = None,
-        offset: Optional[int] = None,
     ) -> list[Row]:
         """Rows for the grid.
 
@@ -1136,8 +1135,6 @@ class Repository:
                 stmt = stmt.where(getattr(self.model, version.key) == version_id)
         if limit:
             stmt = stmt.limit(limit)
-        if offset:
-            stmt = stmt.offset(offset)
 
         rows: list[Row] = []
         with Session(self.engine) as s:

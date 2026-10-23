@@ -47,7 +47,17 @@ from schema import (
 
 
 class Untranslatable(Exception):
-    """This view cannot be expressed in SQL; fall back to doing it in Python."""
+    """This view cannot be expressed in SQL.
+
+    The database defines the view, so a filter it cannot express cannot be
+    part of one. ``key`` names the column at fault, which is what lets the
+    window drop that filter and say why rather than show an answer the filter
+    was never applied to.
+    """
+
+    def __init__(self, message: str, key: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.key = key
 
 
 @dataclass
@@ -63,9 +73,6 @@ class ViewQuery:
     exclude_pks: tuple = ()
     """Rows the caller holds a newer version of, so the query must not
     return them: their stored values would sort and filter them wrongly."""
-
-    def narrowed(self) -> bool:
-        return bool(self.search or (self.filters and self.filters.active_keys()))
 
 
 @dataclass
@@ -249,7 +256,7 @@ class SqlView:
                 try:
                     values.append(parse(col, text, self.lookups))
                 except ValueError as exc:
-                    raise Untranslatable(f"{col.header}: {exc}") from None
+                    raise Untranslatable(f"{col.header}: {exc}", col.key) from None
         return values, wants_blank
 
     def _condition(self, col: ColumnSpec, cond, joins: _Joins):
@@ -267,7 +274,7 @@ class SqlView:
                     float(cond.operand2.replace(",", "")) if cond.operand2 else None
                 )
             except ValueError as exc:
-                raise Untranslatable(str(exc)) from None
+                raise Untranslatable(str(exc), col.key) from None
         else:
             first, second = cond.operand, cond.operand2
 
@@ -285,7 +292,9 @@ class SqlView:
             return expr <= first
         if op in (Op.BETWEEN, Op.NOT_BETWEEN):
             if second is None:
-                raise Untranslatable(f"{col.header}: {op.value} needs two values")
+                raise Untranslatable(
+                    f"{col.header}: {op.value} needs two values", col.key
+                )
             low, high = sorted((first, second))
             inside = expr.between(low, high)
             return inside if op is Op.BETWEEN else or_(~inside, expr.is_(None))
@@ -301,7 +310,9 @@ class SqlView:
             if op is Op.NOT_CONTAINS:
                 return or_(~like, expr.is_(None))
             return like
-        raise Untranslatable(f"{col.header}: {op.value} is not available in SQL")
+        raise Untranslatable(
+            f"{col.header}: {op.value} is not available in SQL", col.key
+        )
 
     def _filter(self, flt: ColumnFilter, joins: _Joins):
         col = self.spec[flt.key]
@@ -434,6 +445,14 @@ class SqlView:
             return {value: int(n) for value, n in session.execute(stmt)}
 
 
+def _everything(_row) -> bool:
+    return True
+
+
+def _unordered(_row) -> int:
+    return 0
+
+
 class MergedView:
     """A windowed view of the table with rows held in memory merged on top.
 
@@ -458,19 +477,19 @@ class MergedView:
     session, so the cost is bounded by hand speed rather than by table size.
     """
 
-    def __init__(self, engine, view: "SqlView", matches, order_key) -> None:
-        #: ``matches(row) -> bool`` and ``order_key(row) -> tuple``, supplied by
-        #: the caller so held rows are judged by exactly the rules the grid
-        #: uses for everything else.
+    def __init__(self, engine, view: "SqlView") -> None:
         self.engine = engine
         self.view = view
-        self.matches = matches
-        self.order_key = order_key
+        #: How held rows are judged: ``matches(row) -> bool`` and
+        #: ``order_key(row)``, set by :meth:`rules` before every refresh so
+        #: they are exactly the rules the grid uses for everything else. Until
+        #: then nothing is held, so these are never consulted.
+        self.matches = _everything
+        self.order_key = _unordered
         self.query = ViewQuery()
         self.clean_total = 0
-        self.held: list[Row] = []           # the ones that matter, in order
-        self.positions: dict[int, int] = {}  # uid -> index in the merged view
-        self._at: dict[int, Row] = {}        # index -> held row
+        self.placed: list[Row] = []          # held rows this view shows, in order
+        self._at: dict[int, Row] = {}        # merged index -> held row
         self.skipped = 0                     # held rows the view filters out
         self.hidden: list[int] = []          # positions of rows deleted this session
 
@@ -496,12 +515,10 @@ class MergedView:
         self.skipped = len(stored) - len(keeping)
         keeping.sort(key=self.order_key)
 
-        self.held = keeping
-        self.positions = {}
+        self.placed = keeping
         self._at = {}
         for ahead, row in enumerate(keeping):
             at = self.view.rank(self.engine, self.query, row.values) + ahead
-            self.positions[row.uid] = at
             self._at[at] = row
 
         # A row deleted in this session still occupies a place in the order --
@@ -527,7 +544,7 @@ class MergedView:
 
     def count(self) -> int:
         """Places in the order, deleted rows included."""
-        return self.clean_total + len(self.held)
+        return self.clean_total + len(self.placed)
 
     def visible_count(self) -> int:
         """Rows the grid shows, deleted ones having collapsed into marks."""

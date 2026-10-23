@@ -360,7 +360,7 @@ def test_deleting_a_row_frees_its_key(spec, repo):
 # -------------------------------------------------------------------- layout
 def test_blank_staging_row_is_always_present(model):
     assert model.staged_count == 1
-    assert model.rowCount() == model.total_db_rows() + 1
+    assert model.rowCount() == model.resident_rows() + 1
     blank = model.row_at(0)
     assert blank.is_staged and blank.is_empty(model.spec)
 
@@ -1075,7 +1075,7 @@ def test_the_grid_drives_a_completely_different_schema(qapp, other_repo):
     model = StagedTableModel(spec)
     model.load(other_repo.load_rows(), other_repo.load_lookups())
     model.validator.set_existing_keys(other_repo.natural_keys())
-    assert model.total_db_rows() == 4
+    assert model.resident_rows() == 4
     assert "reading_id" not in [c.key for c in model.columns]   # pk is the gutter
     assert model.lookups.choices(spec["region_id"]) == ["NORTH", "SOUTH"]
 
@@ -1415,78 +1415,6 @@ def test_commit_lights_up_only_when_there_is_something_to_push(window):
     assert not window.action_commit.isEnabled()
     assert "Fix the" in window.action_commit.toolTip()
 
-
-def test_rows_arrive_in_chunks_until_everything_is_here(window, repo):
-    """The window paints on the first chunk, then the rest follows on its own."""
-    total = repo.count_rows()
-    size = max(1, total // 3)
-    window.set_chunk_size(size)
-    window.reload()
-
-    assert window.model.total_db_rows() == size < total
-    assert window._loading                          # more is on the way
-
-    guard = 0
-    while window._loading and guard < 100:
-        QApplication.processEvents()
-        guard += 1
-
-    assert window.model.total_db_rows() == total    # ...and it all arrived
-    assert not window._loading
-    assert "All" in window._message_label.text()
-
-
-def test_a_background_load_does_not_lose_the_sort(window, repo):
-    """Chunks that arrive while sorted are merged in, not appended blindly."""
-    total = repo.count_rows()
-    window.set_chunk_size(max(1, total // 3))
-    window.reload()
-    model = window.model
-    model.set_sort([("weight", True)])
-
-    guard = 0
-    while window._loading and guard < 100:
-        QApplication.processEvents()
-        guard += 1
-
-    assert model.total_db_rows() == total
-    weights = [
-        model.row_at(r).values["weight"]
-        for r in range(model.staged_count, model.rowCount())
-    ]
-    assert weights == sorted(weights, key=lambda w: (w is None, w), reverse=True)
-
-
-def test_search_and_sort_are_global_once_loading_finishes(window, repo):
-    """The point of loading in the background rather than paging: when it is
-    done, a search sees every row, not just the ones on screen."""
-    rows = repo.load_rows()
-    far = rows[-1]
-    needle = "ONLY-ON-THE-LAST-CHUNK"
-    with Session(repo.engine) as s, s.begin():
-        s.get(repo.model, far.values["id"]).source_ref = needle
-
-    total = repo.count_rows()
-    window.set_chunk_size(max(1, total // 3))
-    window.reload()
-    model = window.model
-
-    model.set_quick_search(needle)
-    assert model.visible_db_rows() == 0             # not fetched yet
-    assert "still loading" in window._counts_label.text()
-    model.set_quick_search("")
-
-    guard = 0
-    while window._loading and guard < 100:
-        QApplication.processEvents()
-        guard += 1
-
-    model.set_quick_search(needle)
-    assert model.visible_db_rows() == 1             # now it is global
-    assert "still loading" not in window._counts_label.text()
-
-
-# ------------------------------------------------- the database-side view
 VIEWS = [
     ("sort by a foreign key label", dict(sort=(("a_id", False),))),
     ("sort by a foreign key, descending", dict(sort=(("a_id", True),))),
@@ -1558,41 +1486,6 @@ def test_the_database_view_agrees_with_the_in_memory_one(qapp, repo, label, view
     assert sql.count(repo.engine, ViewQuery(
         filters=filters, search=view.get("search", ""))) == len(in_memory)
 
-
-def test_read_only_opens_a_model_with_no_natural_key(qapp, repo):
-    from app import MainWindow
-    from schema import ModelA
-
-    other = Repository(engine=repo.engine, model=ModelA, updates_model=None)
-    assert other.spec.unique_constraint is None      # nothing to stage against
-
-    window = MainWindow(other, read_only=True)
-    model = window.model
-    assert model.staged_count == 0                   # no blank row to type into
-    assert not model.index(0, 0).flags() & Qt.ItemFlag.ItemIsEditable
-    assert not window.action_commit.isVisible()
-    assert not window.action_add_row.isVisible()
-    assert model.total_db_rows() > 0
-
-
-def test_read_only_sorting_covers_rows_it_is_not_holding(qapp, repo):
-    """The point of pushing it down: the answer is global even though only a
-    capped slice is in memory."""
-    from app import MainWindow
-
-    window = MainWindow(repo, read_only=True)
-    window.read_only_cap = 5
-    window._requery()
-    model = window.model
-
-    assert model.total_db_rows() == 5 < window._sql_total
-    model.set_sort([("weight", True)])
-    top = model.row_at(0).values["weight"]
-
-    everything = [r.values["weight"] for r in repo.load_rows(latest_version_only=False)]
-    assert top == max(w for w in everything if w is not None)
-
-
 def test_a_filter_sql_cannot_express_says_so_instead_of_lying(qapp, repo):
     """Regex has no SQL equivalent.
 
@@ -1609,20 +1502,18 @@ def test_a_filter_sql_cannot_express_says_so_instead_of_lying(qapp, repo):
     with pytest.raises(Untranslatable):
         sql.statement(ViewQuery(filters=filters))
 
-    window = MainWindow(repo, read_only=True)
-    held = window._sql_total
+    window = MainWindow(repo)
+    before = window.total_rows
     window.model.set_filter(
         ColumnFilter(key="owner", conditions=(Condition(Op.REGEX, "^risk"),))
     )
-    window._requery()
 
     said = window._message_label.text()
     assert "matches regex" in said                   # which filter went wrong
-    assert "not the whole table" in said             # and that it is partial
-    assert f"{held:,} loaded row(s)" in said
-    # the Python fallback really did apply the regex
-    owners = [window.model.row_at(r).values["owner"] for r in range(window.model.rowCount())]
-    assert owners and all(str(o).startswith("risk") for o in owners)
+    assert "not applied" in said                     # and that it did not take
+    # the filter is gone rather than showing in the header without effect
+    assert window.model.filters.get("owner") is None
+    assert window.total_rows == before
 
 
 RANK_VIEWS = [
@@ -1788,9 +1679,8 @@ def test_a_merged_window_equals_holding_every_row(qapp, repo, label, sort, searc
     held = [r for r in model._db_rows if r.original is not None or r.state is not RowState.CLEAN]
     assert len(held) >= 4, "the edits did not take"
 
-    merged = MergedView(
-        repo.engine,
-        SqlView(repo.model, repo.spec, lookups),
+    merged = MergedView(repo.engine, SqlView(repo.model, repo.spec, lookups))
+    merged.rules(
         RowMatcher(repo.spec, lookups, model.filters, search),
         row_order_key(repo.spec, lookups, sort),
     )
@@ -1867,9 +1757,8 @@ def test_deleted_rows_keep_their_gutter_marks_through_a_window(qapp, repo, windo
     assert model.has_trailing_deleted()
 
     held = [r for r in model._db_rows if r.original is not None or r.state is not RowState.CLEAN]
-    merged = MergedView(
-        repo.engine,
-        SqlView(repo.model, repo.spec, lookups),
+    merged = MergedView(repo.engine, SqlView(repo.model, repo.spec, lookups))
+    merged.rules(
         RowMatcher(repo.spec, lookups, model.filters, ""),
         row_order_key(repo.spec, lookups, sort),
     )
@@ -1901,9 +1790,8 @@ def _merged(repo, sort=(), search="", filters=None, show_deleted=False):
     model = StagedTableModel(repo.spec, lookups)
     if filters is not None:
         model.filters = filters
-    source = MergedView(
-        repo.engine,
-        SqlView(repo.model, repo.spec, lookups),
+    source = MergedView(repo.engine, SqlView(repo.model, repo.spec, lookups))
+    source.rules(
         RowMatcher(repo.spec, lookups, model.filters, search),
         row_order_key(repo.spec, lookups, sort),
     )
@@ -2047,9 +1935,7 @@ def merged_window(qapp, repo):
     """
     from app import MainWindow
 
-    window = MainWindow(repo, merged=True)
-    window.window_size = 6
-    window._refresh_window(0, structural=True)
+    window = MainWindow(repo, window=6)
     return window
 
 
@@ -2057,7 +1943,6 @@ def test_the_merged_window_shows_a_table_it_is_not_holding(merged_window, repo):
     window = merged_window
     total = repo.count_rows()
 
-    assert window.merged
     assert window.model.rowCount() == window.model.staged_count + total
     assert window.model.resident_rows() == 6 < total
     assert window.model.staged_count == 1          # you can still type
@@ -2096,6 +1981,43 @@ def test_scrolling_fetches_without_losing_the_selection(merged_window, repo):
     assert back.original is None and back.state is RowState.CLEAN
 
 
+
+def test_scrolling_the_bar_fetches_the_window_under_it(merged_window, repo):
+    """The lazy part, driven the way a person drives it.
+
+    Everything else calls _refresh_window directly; this goes through the
+    scrollbar, which is what actually decides the window in use.
+    """
+    window = merged_window
+    model = window.model
+    bar = window.view.verticalScrollBar()
+    total = repo.count_rows()
+    assert bar.maximum() > 0, "nothing to scroll"
+
+    assert model.window_at == 0
+    bar.setValue(bar.maximum())
+    assert model.window_at > 0, "the window did not follow the scrollbar"
+
+    last = model.row_at(model.rowCount() - 1)
+    assert last is not None, "the last row was not fetched"
+    ordered = repo.load_rows()
+    assert last.values[repo.spec.pk.key] == ordered[-1].values[repo.spec.pk.key]
+
+    bar.setValue(0)
+    assert model.window_at == 0
+    assert model.row_at(model.staged_count) is not None
+
+    # and it does not refetch while the window already covers the viewport
+    model.set_sort([])
+    bar.setValue(0)
+    before = model.resident_rows()
+    fetches = []
+    model.dataChanged.connect(lambda *_: fetches.append(1))
+    bar.setValue(0)
+    assert not fetches, "refetched a window it was already holding"
+    assert model.resident_rows() == before
+    assert total >= model.resident_rows()
+
 def test_an_edit_commits_after_scrolling_past_it(merged_window, repo):
     window = merged_window
     model = window.model
@@ -2122,6 +2044,47 @@ def test_an_edit_commits_after_scrolling_past_it(merged_window, repo):
     assert window.unsaved_changes()
     assert model.row_by_uid(uid) is not None
 
+
+
+def test_deleting_a_row_shrinks_the_view_it_is_not_holding(merged_window, repo):
+    """The count comes from the database, which does not know about a deletion
+    made here -- so without re-asking, the grid keeps a phantom row at the end
+    that nothing can fill."""
+    window = merged_window
+    model = window.model
+    before_rows = model.rowCount()
+    before_total = window.total_rows
+
+    model.delete_rows([model.staged_count + 1])
+
+    assert window.total_rows == before_total - 1
+    assert model.rowCount() == before_rows - 1
+    # every row the grid claims to have is one it can show
+    for visual in range(model.staged_count, model.staged_count + model.visible_db_rows()):
+        assert model.row_at(visual) is not None
+
+    window.undo_stack.undo()
+    assert window.total_rows == before_total
+    assert model.rowCount() == before_rows
+
+
+def test_a_deletion_keeps_your_place_but_a_re_sort_does_not(merged_window, repo):
+    """Re-ordering makes the top the only sensible place to be; deleting a row
+    does not move anything, so the window should stay where the reader is."""
+    window = merged_window
+    model = window.model
+    total = repo.count_rows()
+    assert total > 8, "need enough rows to scroll"
+
+    window._refresh_window(total - 4)
+    away = model.window_at
+    assert away > 0
+
+    model.delete_rows([model.staged_count + away + 1])
+    assert model.window_at == away, "a deletion sent the view back to the top"
+
+    model.set_sort([("weight", True)])
+    assert model.window_at == 0, "a re-sort should start at the top"
 
 def test_the_filter_checklist_covers_the_table_not_the_window(merged_window, repo):
     """A checklist of whatever happens to be on screen is worse than useless."""
@@ -2172,26 +2135,6 @@ def test_sorting_in_merged_mode_covers_rows_it_is_not_holding(merged_window, rep
         w for w in everything if w is not None
     )
 
-
-def test_the_toggle_switches_modes_both_ways(qapp, repo):
-    from app import MainWindow
-
-    window = MainWindow(repo)
-    assert not window.merged
-    held_everything = window.model.resident_rows()
-
-    window.set_merged(True)
-    assert window.merged
-    assert window.model.windowed
-    assert window.model.resident_rows() <= window.window_size
-
-    window.set_merged(False)
-    assert not window.merged
-    assert not window.model.windowed
-    assert window.model.resident_rows() == held_everything
-
-
-# ------------------------------------------ what the windowing audit caught
 def test_deleting_a_selection_reaches_past_the_window(merged_window, repo):
     """Select-all and delete must not quietly delete only what is on screen."""
     window = merged_window

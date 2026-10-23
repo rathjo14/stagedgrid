@@ -278,13 +278,9 @@ class StagedTableModel(QAbstractTableModel):
         lookups: Optional[Lookups] = None,
         undo_stack: Optional[QUndoStack] = None,
         parent=None,
-        read_only: bool = False,
     ) -> None:
         super().__init__(parent)
         self.spec = spec
-        #: Read-only grids have no staging row and no editable cells, which is
-        #: what lets any mapped class be opened, not just one with a natural key.
-        self.read_only = read_only
         #: The columns the grid shows: everything but the primary key, which
         #: is the row index in the gutter instead of a cell.
         self.columns = tuple(c for c in spec.columns if not c.is_pk)
@@ -323,40 +319,16 @@ class StagedTableModel(QAbstractTableModel):
             self.lookups = lookups
             self.validator.lookups = lookups
         self._db_rows = list(rows)
-        self._staged = [] if self.read_only else [Row.staged(self.spec)]
+        # A fresh start, so nothing is pending: without this, reloading (to
+        # open a branch, say) leaves the previous session's held rows behind
+        # and every one of their edits is counted twice.
+        self._held.clear()
+        self._staged = [Row.staged(self.spec)]
         self.validator.set_existing_keys(existing_key_map(self.spec, self._db_rows))
         self._reindex()
         self._rebuild_order()
         self.endResetModel()
         self.undo_stack.clear()
-        self.stateChanged.emit()
-
-    def append_rows(self, rows: Sequence[Row]) -> None:
-        """Add more stored rows to what is already here.
-
-        Used by the background loader. When nothing is sorted, filtered or
-        searched the new rows land at the end of the view, so they can be
-        inserted without disturbing the selection or the scroll position;
-        otherwise they have to be merged in and the view is rebuilt.
-        """
-        if not rows:
-            return
-        tidy = not (self._sort_keys or self.filters.active_keys()
-                    or self._quick_search or self._show_deleted)
-        if tidy:
-            at = len(self._staged) + len(self._view)
-            self.beginInsertRows(QModelIndex(), at, at + len(rows) - 1)
-            self._db_rows.extend(rows)
-            self._by_uid.update({r.uid: r for r in rows})
-            self._view.extend(range(len(self._db_rows) - len(rows), len(self._db_rows)))
-            self._order = list(self._view)
-            self.endInsertRows()
-        else:
-            self.beginResetModel()
-            self._db_rows.extend(rows)
-            self._by_uid.update({r.uid: r for r in rows})
-            self._rebuild_order()
-            self.endResetModel()
         self.stateChanged.emit()
 
     def _reindex(self) -> None:
@@ -369,25 +341,19 @@ class StagedTableModel(QAbstractTableModel):
             self._by_uid.update(self._held)
         self._by_uid.update({r.uid: r for r in self._staged})
 
-    # ------------------------------------------------------ merged windowing
-    @property
-    def windowed(self) -> bool:
-        """Is the database computing the view, with only a window resident?"""
-        return self._window is not None
-
+    # ------------------------------------------------------------- windowing
     def set_window_source(self, source) -> None:
         """Hand ordering, filtering and searching to the database.
 
         ``source`` is a :class:`sqlview.MergedView`. Once set, the model stops
         computing the view itself: ``rowCount`` becomes the count the database
         reports, and the rows it holds are whatever window was last fetched.
+        Left unset -- which is how the tests use it -- the model sorts and
+        filters the rows it was given, and that is what the SQL translation is
+        checked against.
         """
         self._window = source
         self._window_at = 0
-        if source is None:
-            # Back to holding everything: the held set was only ever a stand-in
-            # for rows that were not resident, and now they all will be.
-            self._held.clear()
 
     def load_window(
         self, rows: Sequence[Row], at: int, structural: bool = False
@@ -561,7 +527,7 @@ class StagedTableModel(QAbstractTableModel):
         if row is None or row.state is RowState.DELETED:
             return base
         col = self.columns[index.column()]
-        editable = not self.read_only and (
+        editable = (
             col.editable_on_staged if row.is_staged else col.editable_on_existing
         )
         if editable:
@@ -784,10 +750,12 @@ class StagedTableModel(QAbstractTableModel):
         self.revalidate(emit=False)
         self.endResetModel()
         self.stateChanged.emit()
+        # A deleted row leaves the view, so there is one row fewer to show.
+        # In windowed mode the count came from the database before the
+        # deletion, so without this the grid keeps a phantom row at the end.
+        self.viewChanged.emit()
 
     def _normalise_staging(self) -> None:
-        if self.read_only:
-            return
         """Keep exactly one trailing blank staging row."""
         spec = self.spec
         while (
@@ -985,7 +953,7 @@ class StagedTableModel(QAbstractTableModel):
         return self._window_at
 
     def resident_rows(self) -> int:
-        """How many rows are actually in memory, window or not."""
+        """How many stored rows are actually in memory."""
         return len(self._db_rows)
 
     def set_show_deleted(self, show: bool) -> None:
@@ -1200,16 +1168,8 @@ class StagedTableModel(QAbstractTableModel):
     def row_by_uid(self, uid: int) -> Optional[Row]:
         return self._by_uid.get(uid)
 
-    def visual_row_of_pk(self, pk: int) -> int:
-        for offset, db_index in enumerate(self._view):
-            if self._db_rows[db_index].values.get(self.spec.pk.key) == pk:
-                return len(self._staged) + offset
-        return -1
-
-    def total_db_rows(self) -> int:
-        return len(self._db_rows)
-
     def visible_db_rows(self) -> int:
+        """Stored rows the resident window is showing."""
         return len(self._view)
 
 

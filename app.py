@@ -59,7 +59,6 @@ _use_venv_if_needed()
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import (
     QAction,
-    QActionGroup,
     QColor,
     QKeySequence,
     QUndoStack,
@@ -111,18 +110,11 @@ import darkdetect     # which way "auto" goes (Qt only knows from 6.5)
 
 BLANKS_LABEL = "(Blanks)"   # how an empty value reads in the filter checklist
 
-#: How many rows to fetch at a time, offered in Data > Load in chunks of.
-#: The first chunk paints the window; the rest arrive in the background until
-#: the whole version is here, so sorting and searching stay global. None
-#: fetches everything in one query.
-CHUNK_SIZES = (None, 500, 1_000, 2_500, 5_000, 10_000)
-DEFAULT_CHUNK_SIZE = 2_500
-
-#: Rows held at once in merged mode. Big enough that ordinary scrolling and
-#: a page-down stay inside it, small enough that footprint does not follow
-#: table size. Each held edit costs one count query per rebuild, not per row,
-#: so this only bounds what is fetched.
-MERGED_WINDOW = 500
+#: Rows held at once. The database does the ordering, filtering and
+#: searching over the whole table, so this only bounds what is fetched to
+#: show: big enough that scrolling and a page-down stay inside it, small
+#: enough that memory does not follow table size.
+WINDOW_ROWS = 1_000
 
 #: Commit goes this colour when there is something to push.
 COMMIT_READY = QColor("#7B4FBF")
@@ -451,71 +443,40 @@ class MainWindow(QMainWindow):
         self,
         repository: Repository,
         sink: Optional[Callable[[dict[str, Any]], str]] = None,
-        limit: Optional[int] = None,
+        window: Optional[int] = None,
         parent=None,
-        read_only: bool = False,
-        merged: bool = False,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
         self.sink = sink or file_sink()
-        self.limit = limit
 
         self.setWindowTitle(f"stagedgrid - {repository.spec.table_name}")
         self.resize(1480, 840)
         self.setStyleSheet(stylesheet())
 
-        self.read_only = read_only
-        #: Merged mode: the database orders, filters and searches, and the rows
-        #: this session has edited are merged back on top of its answer. Same
-        #: machinery as read-only mode, except the grid can still be typed in.
-        self.merged = bool(merged) and not read_only
-        #: In read-only and merged modes the database does the ordering,
-        #: filtering and searching, so only a window is ever held. That is what
-        #: lets any mapped class be opened, however large.
-        self.sql_view = (
-            SqlView(repository.model, repository.spec, Lookups())
-            if read_only or self.merged
-            else None
-        )
-        self.merged_view = (
-            MergedView(repository.engine, self.sql_view, lambda row: True, lambda row: 0)
-            if self.merged
-            else None
-        )
-        #: How many rows merged mode holds at once.
-        self.window_size = limit or MERGED_WINDOW
+        #: How many rows are held at once. The database orders, filters and
+        #: searches the whole table; this only bounds what is fetched to show.
+        self.window_size = window or WINDOW_ROWS
+        self.total_rows = 0          # rows matching the current view
         self._requerying = False
-        self._sql_total = 0
-        #: How many matching rows a read-only grid will hold at once. The
-        #: ordering and filtering still cover the whole table; this only caps
-        #: what is fetched for display, so memory does not follow table size.
-        self.read_only_cap = limit or 2_000
+        self._shape = None           # the view's definition, to spot a re-sort
+
         self.undo_stack = QUndoStack(self)
-        self.model = StagedTableModel(
-            repository.spec, undo_stack=self.undo_stack, read_only=read_only
+        self.model = StagedTableModel(repository.spec, undo_stack=self.undo_stack)
+        self.source = MergedView(
+            repository.engine,
+            SqlView(repository.model, repository.spec, Lookups()),
         )
-        if self.merged:
-            self.model.set_window_source(self.merged_view)
+        self.model.set_window_source(self.source)
+
         self.view = GridView(self.model, self)
-        self._following = False
-        if self.merged:
-            # The scrollbar's value is then the index of the top row, which is
-            # what decides which window to hold.
-            self.view.setVerticalScrollMode(
-                QAbstractItemView.ScrollMode.ScrollPerItem
-            )
-            self._follow_window(True)
+        # Per item, so the scrollbar's value is the index of the top row --
+        # which is what decides the window to hold.
+        self.view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerItem)
+        self.view.verticalScrollBar().valueChanged.connect(self._window_follow)
         self.setCentralWidget(self.view)
+
         self.branch: Optional[Branch] = None
-        self.chunk_size: Optional[int] = (
-            limit if limit is not None else DEFAULT_CHUNK_SIZE
-        )
-        self.total_rows = 0
-        self._loading = False
-        self._load_timer = QTimer(self)
-        self._load_timer.setSingleShot(True)
-        self._load_timer.timeout.connect(self._load_next_chunk)
         self._commit_button = None
         # A bound method, not a lambda: Qt drops the connection when this
         # window is destroyed, instead of calling into a deleted stack.
@@ -523,17 +484,11 @@ class MainWindow(QMainWindow):
         self._build_branch_dock()
 
         self._build_actions()
-        self._build_merged_action()
         self._build_toolbar()
         self._build_menus()
         self._build_status_bar()
-        if read_only:
-            self._strip_editing_chrome()
 
-        if read_only:
-            self.model.viewChanged.connect(self._requery)
-        if self.merged:
-            self.model.viewChanged.connect(self._reload_view)
+        self.model.viewChanged.connect(self._reload_view)
         self.view.filterRequested.connect(self.show_filter_dialog)
         self.view.statsChanged.connect(self._stats_label.setText)
         self.model.stateChanged.connect(self._refresh)
@@ -542,21 +497,6 @@ class MainWindow(QMainWindow):
         self.reload()
 
     # ------------------------------------------------------------- chrome
-    def _strip_editing_chrome(self) -> None:
-        """Hide everything that only makes sense when you can edit."""
-        for action in (
-            self.action_add_row, self.action_delete, self.action_revert,
-            self.action_undo, self.action_redo, self.action_commit,
-            self.action_branches, self.action_export, self.action_show_deleted,
-        ):
-            action.setVisible(False)
-            action.setEnabled(False)
-        self.branch_dock.hide()
-        self.deleted_toggle.hide()
-        self.setWindowTitle(
-            f"{self.windowTitle()} - read only"
-        )
-
     def _build_branch_dock(self) -> None:
         """A collapsible list of branches in the Updates table.
 
@@ -577,70 +517,6 @@ class MainWindow(QMainWindow):
         )
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.branch_dock)
         self.branch_dock.hide()        # collapsed until asked for
-
-    def _build_merged_action(self) -> None:
-        """Data > Let the database do the work.
-
-        A toggle rather than a restart, because which mode suits depends on
-        what the table turns out to be like, and the only way to find that out
-        is to open it.
-        """
-        self.action_merged = QAction("Let the database do the work", self)
-        self.action_merged.setCheckable(True)
-        self.action_merged.setChecked(self.merged)
-        self.action_merged.setToolTip(
-            "Order, filter and search in the database, holding only a window "
-            "of rows. Edits made here are merged on top."
-        )
-        self.action_merged.toggled.connect(self.set_merged)
-
-    def set_merged(self, on: bool) -> None:
-        """Switch between holding every row and holding a window."""
-        on = bool(on) and not self.read_only
-        if on == self.merged:
-            return
-        if not self._may_reload("Switching how the view is computed"):
-            self.action_merged.setChecked(self.merged)   # put it back
-            return
-        self._stop_loading()
-        self.merged = on
-        if on:
-            if self.sql_view is None:
-                self.sql_view = SqlView(
-                    self.repository.model, self.repository.spec, self.model.lookups
-                )
-            if self.merged_view is None:
-                self.merged_view = MergedView(
-                    self.repository.engine, self.sql_view,
-                    lambda row: True, lambda row: 0,
-                )
-            self.model.set_window_source(self.merged_view)
-            self.view.setVerticalScrollMode(
-                QAbstractItemView.ScrollMode.ScrollPerItem
-            )
-            self._follow_window(True)
-            self.model.viewChanged.connect(self._reload_view)
-        else:
-            self.model.set_window_source(None)
-            self._follow_window(False)
-            self.model.viewChanged.disconnect(self._reload_view)
-        self.reload()
-
-    def _follow_window(self, on: bool) -> None:
-        """Connect or drop the scroll handler, once either way.
-
-        Kept as a flag rather than disconnecting blind: Qt only warns when a
-        signal was not connected, so a stray disconnect fails silently and
-        leaves a handler running against a mode that no longer exists.
-        """
-        if on == self._following:
-            return
-        bar = self.view.verticalScrollBar()
-        if on:
-            bar.valueChanged.connect(self._window_follow)
-        else:
-            bar.valueChanged.disconnect(self._window_follow)
-        self._following = on
 
     def _build_actions(self) -> None:
         self.action_reload = QAction("Reload", self)
@@ -669,17 +545,6 @@ class MainWindow(QMainWindow):
 
         self.action_clear_sort = QAction("Clear sort", self)
         self.action_clear_sort.triggered.connect(self.model.clear_sort)
-
-        self.chunk_actions = []
-        for size in CHUNK_SIZES:
-            action = QAction("Everything at once" if size is None
-                             else f"{size:,} rows", self)
-            action.setCheckable(True)
-            action.setData(size)
-            action.triggered.connect(
-                lambda _checked, chosen=size: self.set_chunk_size(chosen)
-            )
-            self.chunk_actions.append(action)
 
         self.action_branches = QAction("Branches", self)
         self.action_branches.setCheckable(True)
@@ -781,14 +646,6 @@ class MainWindow(QMainWindow):
         data_menu.addAction(self.action_show_deleted)
         data_menu.addAction(self.action_fit)
         data_menu.addSeparator()
-        if not self.read_only:
-            data_menu.addAction(self.action_merged)
-        chunks = data_menu.addMenu("Load in chunks of")
-        group = QActionGroup(self)
-        group.setExclusive(True)
-        for action in self.chunk_actions:
-            group.addAction(action)
-            chunks.addAction(action)
         data_menu.addSeparator()
         data_menu.addAction(self.action_branches)
         data_menu.addAction(self.action_dark)
@@ -815,25 +672,25 @@ class MainWindow(QMainWindow):
 
     # --------------------------------------------------------------- data
     def reload(self) -> None:
-        self._stop_loading()
+        """Open the table: the database computes the view, we hold a window.
+
+        Validation still covers the whole version, because it holds the key
+        index rather than the rows -- the one question a window cannot answer
+        for itself.
+        """
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             lookups = self.repository.load_lookups()
-            if self.merged:
-                return self._reload_merged(lookups)
-            if self.read_only:
-                self.sql_view.lookups = lookups
-                rows = self._sql_rows()
-                self.total_rows = self._sql_total
-            else:
-                version_id = self.branch.version_id if self.branch else None
-                self.total_rows = self.repository.count_rows(version_id=version_id)
-                rows = self.repository.load_rows(
-                    limit=self.chunk_size, version_id=version_id
+            version_id = self.branch.version_id if self.branch else None
+            self.model.load([], lookups)
+            self.model.validator.set_existing_keys(
+                self.repository.natural_keys(
+                    latest_version_only=version_id is None, version_id=version_id
                 )
-            self.model.load(rows, lookups)
-            self.model.validator.set_existing_keys(self.repository.natural_keys())
-            replayed = self.model.replay(self.branch.changes) if self.branch else None
+            )
+            replayed = self._replay_branch()
+            self._refresh_window(0, structural=True)
+            self._shape = self._view_shape()
         except Exception as exc:
             QApplication.restoreOverrideCursor()
             QMessageBox.critical(
@@ -841,67 +698,9 @@ class MainWindow(QMainWindow):
             )
             return
         QApplication.restoreOverrideCursor()
-        note = f"Loaded {len(rows):,} row(s) from {self.repository.spec.table_name}"
-        if self.read_only and len(rows) < self._sql_total:
-            note += f" (first {len(rows):,} of {self._sql_total:,} matching)"
-        # Read-only mode fetches exactly the capped slice the database was
-        # asked for; there is no "rest" to stream in behind it.
-        self._loading = not self.read_only and len(rows) < self.total_rows
-        if self._loading:
-            note += f"   |   fetching the rest of {self.total_rows:,}..."
-            self._load_timer.start(0)
-        version = self.repository.version_column
-        if version is not None:
-            shown = (
-                self.branch.version_label
-                if self.branch
-                else (self.repository.latest_version() or (None, ""))[1]
-            )
-            note += f"   |   {version.header} {shown}"
-        if replayed:
-            note += (
-                f"   |   branch {self.branch.label or self.branch.id}: "
-                f"+{replayed['inserts']} ~{replayed['updates']} "
-                f"-{replayed['deletes']}"
-            )
-            if replayed["missing"]:
-                note += f" ({replayed['missing']} row(s) no longer exist)"
-        self._refresh_branches()
-        self._sync_chunk_actions()
-        self.flash(note)
-
-    def _reload_merged(self, lookups: Lookups) -> None:
-        """Open the table with the database computing the view.
-
-        Validation still covers the whole version, because it holds the key
-        index rather than the rows -- which is the only thing a window cannot
-        answer for itself.
-        """
-        version_id = self.branch.version_id if self.branch else None
-        self.model.load([], lookups)
-        self.model.validator.set_existing_keys(
-            self.repository.natural_keys(
-                latest_version_only=version_id is None, version_id=version_id
-            )
-        )
-        replayed = None
-        if self.branch:
-            # The branch names rows by primary key that this window will not be
-            # holding, so fetch exactly those and hand them over first.
-            payload = self.branch.changes or {}
-            operations = payload.get("operations") or []
-            pks = [
-                op.get("pk")
-                for op in operations
-                if isinstance(op, dict) and op.get("pk") is not None
-            ]
-            self.model.seed_held(self.repository.load_rows_by_pk(pks))
-            replayed = self.model.replay(payload)
-        self._refresh_window(0, structural=True)
-        QApplication.restoreOverrideCursor()
 
         note = (
-            f"{self._sql_total:,} row(s) in {self.repository.spec.table_name}, "
+            f"{self.total_rows:,} row(s) in {self.repository.spec.table_name}, "
             f"holding {self.model.resident_rows():,}"
         )
         version = self.repository.version_column
@@ -921,8 +720,26 @@ class MainWindow(QMainWindow):
             if replayed["missing"]:
                 note += f" ({replayed['missing']} row(s) no longer exist)"
         self._refresh_branches()
-        self._sync_chunk_actions()
         self.flash(note)
+
+    def _replay_branch(self):
+        """Put a stored branch's changes back, fetching the rows they name.
+
+        A branch addresses rows by primary key, and the window almost
+        certainly does not hold them, so those exact rows are fetched and
+        handed over before the changes are applied to them.
+        """
+        if not self.branch:
+            return None
+        payload = self.branch.changes or {}
+        operations = payload.get("operations") or []
+        pks = [
+            op.get("pk")
+            for op in operations
+            if isinstance(op, dict) and op.get("pk") is not None
+        ]
+        self.model.seed_held(self.repository.load_rows_by_pk(pks))
+        return self.model.replay(payload)
 
     # ------------------------------------------------------------ branches
     def _show_branches(self, shown: bool) -> None:
@@ -930,8 +747,20 @@ class MainWindow(QMainWindow):
         if shown:
             self._refresh_branches()
 
-    # ---------------------------------------------------- merged, sql side
-    def _merged_query(self) -> "ViewQuery":
+    def _view_shape(self) -> tuple:
+        """What the view is defined by, so a re-sort can be told from a delete."""
+        return (
+            tuple(self.model.sort_keys),
+            tuple(
+                (key, flt.describe())
+                for key in sorted(self.model.filters.active_keys())
+                for flt in [self.model.filters.get(key)]
+                if flt is not None
+            ),
+            self.model.quick_search,
+        )
+
+    def _query(self) -> "ViewQuery":
         """The view the grid is asking for, without a window on it yet."""
         return ViewQuery(
             sort=tuple(self.model.sort_keys),
@@ -944,56 +773,87 @@ class MainWindow(QMainWindow):
             ),
         )
 
-    def _refresh_window(self, at: int, structural: bool = False) -> None:
+    def _refresh_window(self, at: int, structural: bool = False) -> bool:
         """Work out the view, then hold the slice of it starting at ``at``.
 
         ``structural`` means the shape changed, not just which part is on
         screen -- a new sort, filter or search. A plain scroll must not reset
         the model or the scroll position goes with it.
+
+        Returns whether the view is now what was asked for, so a caller does
+        not report success over the top of a refusal.
         """
-        if self._requerying or not self.merged:
-            return
+        if self._requerying:
+            return False
+        refused = None
+        failed = None
         self._requerying = True
         try:
             lookups = self.model.lookups
-            self.sql_view.lookups = lookups
-            self.merged_view.rules(
+            self.source.view.lookups = lookups
+            self.source.rules(
                 RowMatcher(
                     self.repository.spec, lookups,
                     self.model.filters, self.model.quick_search,
                 ),
                 row_order_key(self.repository.spec, lookups, self.model.sort_keys),
             )
-            query = self._merged_query()
-            self.merged_view.refresh(
-                query, self.model.held_rows(), self.model.showing_deleted
+            self.source.refresh(
+                self._query(), self.model.held_rows(), self.model.showing_deleted
             )
-            self._sql_total = self.merged_view.visible_count()
-            self.total_rows = self._sql_total
-            rows = self.merged_view.visible_slice(at, self.window_size)
+            self.total_rows = self.source.visible_count()
+            rows = self.source.visible_slice(at, self.window_size)
             self.model.load_window(rows, at, structural=structural)
         except Untranslatable as exc:
-            self.flash(f"{exc} -- not available with the database doing the work", True)
+            refused = exc
         except Exception as exc:
-            self.flash(f"Query failed: {exc}", True)
+            failed = exc
         finally:
             self._requerying = False
 
+        if failed is not None:
+            self.flash(f"Query failed: {failed}", True)
+            return False
+        if refused is not None:
+            # The database defines the view, so a filter it cannot express
+            # cannot be part of one. Dropping it and saying why beats leaving
+            # a filter in the header that was never applied -- clearing it
+            # asks again, which is the refresh that actually lands.
+            if refused.key is not None:
+                self.model.clear_filters(refused.key)
+            self.flash(f"{refused}, so that filter was not applied", True)
+            return False
+        return True
+
     def _reload_view(self) -> None:
-        """The sort, filter or search changed: ask the database again."""
-        self._refresh_window(0, structural=True)
-        self.view.scrollToTop()
+        """The view changed: ask the database again.
+
+        Two kinds of change arrive here. A new sort, filter or search puts the
+        rows in a different order, so the only sensible place to be is the
+        top. Deleting a row, or showing the deleted ones, leaves the order
+        alone -- so keep the window where the reader left it.
+        """
+        shape = self._view_shape()
+        reordered = shape != self._shape
+        self._shape = shape
+
+        if not self._refresh_window(
+            0 if reordered else self.model.window_at, structural=True
+        ):
+            return
+        if reordered:
+            self.view.scrollToTop()
         held = len(self.model.held_rows())
-        note = f"{self._sql_total:,} row(s) match"
+        note = f"{self.total_rows:,} row(s) match"
         if held:
             note += f", {held} of them edited here"
-        if self.merged_view.skipped:
-            note += f" ({self.merged_view.skipped} edited row(s) no longer match)"
+        if self.source.skipped:
+            note += f" ({self.source.skipped} edited row(s) no longer match)"
         self.flash(note)
 
     def _window_follow(self) -> None:
         """Hold the window the viewport is looking at."""
-        if not self.merged or self._requerying:
+        if self._requerying:
             return
         top = max(0, self.view.verticalScrollBar().value() - self.model.staged_count)
         height = max(1, self.view.verticalHeader().defaultSectionSize())
@@ -1006,111 +866,7 @@ class MainWindow(QMainWindow):
         # little does not refetch.
         self._refresh_window(max(0, top - self.window_size // 4))
 
-    # ------------------------------------------------- read-only, sql side
-    def _sql_query(self) -> "ViewQuery":
-        return ViewQuery(
-            sort=tuple(self.model.sort_keys),
-            filters=self.model.filters,
-            search=self.model.quick_search,
-            limit=self.read_only_cap,
-        )
-
-    def _sql_rows(self) -> list:
-        """Ask the database for the current view, capped for display."""
-        query = self._sql_query()
-        self._sql_total = self.sql_view.count(self.repository.engine, query)
-        return self.sql_view.rows(self.repository.engine, query)
-
-    def _requery(self) -> None:
-        """The sort or filter moved: ask the database again, not the rows here.
-
-        This is what makes ordering and filtering cover the whole table in
-        read-only mode rather than only what is loaded.
-        """
-        if self._requerying or not self.read_only:
-            return
-        self._requerying = True
-        try:
-            rows = self._sql_rows()
-            self.model.load(rows, self.model.lookups)
-        except Untranslatable as exc:
-            # No SQL for this one, so the grid falls back to filtering the rows
-            # it holds. That is a real answer, but only about those rows, and
-            # saying so is the difference between a limit and a wrong result.
-            held = self.model.rowCount()
-            self.flash(
-                f"{exc} -- matched {held:,} of the "
-                f"{self._sql_total:,} loaded row(s) only, not the whole table",
-                True,
-            )
-        except Exception as exc:
-            self.flash(f"Query failed: {exc}", True)
-        else:
-            shown, total = len(rows), self._sql_total
-            self.flash(
-                f"{total:,} row(s) match"
-                + (f", showing the first {shown:,}" if shown < total else "")
-            )
-        finally:
-            self._requerying = False
-
-    # --------------------------------------------------- background loading
-    def _load_next_chunk(self) -> None:
-        """Fetch the next chunk and add it, keeping the window responsive.
-
-        One chunk per event-loop turn: the user can scroll, type and search
-        while the rest arrives.
-        """
-        if not self._loading:
-            return
-        loaded = self.model.total_db_rows()
-        if loaded >= self.total_rows:
-            self._finish_loading()
-            return
-        try:
-            rows = self.repository.load_rows(
-                limit=self.chunk_size,
-                offset=loaded,
-                version_id=self.branch.version_id if self.branch else None,
-            )
-        except Exception as exc:  # pragma: no cover - surfaced in the status bar
-            self._loading = False
-            self.flash(f"Could not fetch the rest: {exc}", True)
-            return
-        if not rows:
-            self._finish_loading()
-            return
-        self.model.append_rows(rows)
-        now = self.model.total_db_rows()
-        self.flash(f"Loading... {now:,} of {self.total_rows:,}")
-        if now >= self.total_rows:
-            self._finish_loading()
-        else:
-            self._load_timer.start(0)
-
-    def _finish_loading(self) -> None:
-        self._loading = False
-        self.flash(
-            f"All {self.model.total_db_rows():,} row(s) loaded"
-            + (f" for branch {self.branch.label or self.branch.id}"
-               if self.branch else "")
-        )
-        self._refresh()
-
-    def _stop_loading(self) -> None:
-        self._loading = False
-        self._load_timer.stop()
-
-    def set_chunk_size(self, size: Optional[int]) -> None:
-        if size == self.chunk_size:
-            return
-        self.chunk_size = size
-        self._sync_chunk_actions()
-        self.flash(
-            "Everything is fetched in one query" if size is None
-            else f"Fetching {size:,} rows at a time from now on"
-        )
-
+    # ----------------------------------------------------------- reloading
     def _may_reload(self, why: str) -> bool:
         """Ask before throwing away edits that have not been pushed."""
         if not self.unsaved_changes():
@@ -1124,10 +880,6 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         return answer == QMessageBox.StandardButton.Yes
-
-    def _sync_chunk_actions(self) -> None:
-        for action in self.chunk_actions:
-            action.setChecked(action.data() == self.chunk_size)
 
     def unsaved_changes(self) -> bool:
         """Has anything been edited since the grid was loaded?
@@ -1181,28 +933,10 @@ class MainWindow(QMainWindow):
 
     def _refresh(self) -> None:
         counts = self.model.dirty_counts()
-        if self.merged:
-            self._counts_label.setText(
-                f"  {self._sql_total:,} row(s)"
-                f", holding {self.model.resident_rows():,}"
-                + "   |   "
-                f"+{counts['inserts']}  ~{counts['updates']}  -{counts['deletes']}"
-                + (f"   |   {counts['errors']} problem(s)" if counts["errors"] else "")
-            )
-            self._refresh_commit_button()
-            return
         self._counts_label.setText(
-            f"  {self.model.total_db_rows():,} row(s)"
-            + (f" of {self.total_rows:,}" if self._loading else "")
-            + f", showing {self.model.visible_db_rows()}"
-            + (
-                # Until everything is here, a sort or search only covers what
-                # has arrived. Say so rather than let it look complete.
-                " (still loading - covers the rows fetched so far)"
-                if self._loading and self._view_is_narrowed()
-                else ""
-            )
-            + "   |   "
+            f"  {self.total_rows:,} row(s), holding "
+            f"{self.model.resident_rows():,}"
+            "   |   "
             f"+{counts['inserts']}  ~{counts['updates']}  -{counts['deletes']}"
             + (f"   |   {counts['errors']} problem(s)" if counts["errors"] else "")
         )
@@ -1210,14 +944,6 @@ class MainWindow(QMainWindow):
 
     def _on_clean_changed(self, _clean: bool) -> None:
         self._refresh_commit_button()
-
-    def _view_is_narrowed(self) -> bool:
-        """Is a sort, filter or search in force?"""
-        return bool(
-            self.model.sort_keys
-            or self.model.filters.active_keys()
-            or self.model.quick_search
-        )
 
     def _refresh_commit_button(self) -> None:
         """Commit only lights up when there is something to push."""
@@ -1586,18 +1312,16 @@ def main(argv: list[str] | None = None) -> int:
              "wrong -- see --describe.",
     )
     parser.add_argument(
-        "--read-only",
-        action="store_true",
-        help="open any mapped class read-only: the database does the "
-             "ordering, filtering and searching, so table size does not "
-             "become memory. No editing, no staging row, no branches.",
-    )
-    parser.add_argument(
         "--describe",
         action="store_true",
         help="print what the grid worked out about the table, and exit",
     )
-    parser.add_argument("--limit", type=int, default=None, help="max rows to load")
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=None,
+        help="rows held at once (default 1000)",
+    )
     parser.add_argument(
         "--changesets",
         default="changesets",
@@ -1608,14 +1332,6 @@ def main(argv: list[str] | None = None) -> int:
         choices=("auto", "light", "dark"),
         default="auto",
         help="auto follows the desktop (default)",
-    )
-    parser.add_argument(
-        "--merged",
-        action="store_true",
-        help=(
-            "let the database order, filter and search, holding only a window "
-            "and merging this session's edits on top; editing still works"
-        ),
     )
     args = parser.parse_args(argv)
 
@@ -1660,9 +1376,7 @@ def main(argv: list[str] | None = None) -> int:
     window = MainWindow(
         repository,
         sink=file_sink(args.changesets),
-        limit=args.limit,
-        read_only=args.read_only,
-        merged=args.merged,
+        window=args.window,
     )
     window.show()
     return app.exec()

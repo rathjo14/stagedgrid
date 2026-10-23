@@ -11,11 +11,9 @@ changeset that is handed to another API on commit.
 ```bash
 source .venv/Scripts/activate     # or .venv\Scripts\activate.bat on cmd
 python app.py                     # the grid
-python app.py --read-only --model yourrepo.models:Invoice   # any table, read-only
-python app.py --merged            # editing, but holding a window not the table
 python schema.py --reset --rows 400   # (re)seed the demo data
 python schema.py --reset --rows 10000 --one-version   # a realistic single version
-python -m pytest                  # 158 tests, no server needed (sqlite)
+python -m pytest                  # 155 tests, no server needed (sqlite)
 ```
 
 There is no package and nothing to install: five modules in one folder that
@@ -36,10 +34,9 @@ SQLAlchemy 2.1, so newer versions are fine.
 pandas is deliberately not used -- see the note in `requirements.txt`.
 
 The DSN defaults to `postgresql+psycopg2://postgres:postgres@localhost:5432/benchmark`;
-override with `STAGEDGRID_DSN` or `--dsn`. `--limit N` caps the initial load,
-`--changesets DIR` says where committed payloads are written, and
-`--read-only` opens any model without the editing side, and `--merged`
-keeps the editing side while holding only a window.
+override with `STAGEDGRID_DSN` or `--dsn`. `--window N` sets how many rows are
+held at once (1,000 by default) and `--changesets DIR` says where committed
+payloads are written.
 
 ## The five files
 
@@ -58,7 +55,7 @@ Imports only ever go one way: `schema <- data <- {sqlview, grid} <- app`.
 | `schema.py` | the A-E models (your repo's stand-in), `TableSpec`/`ColumnSpec` introspection, text<->value conversion, the dimension `Lookups`, the engine helper, and the demo seeder with its CLI |
 | `data.py` | `Row`/`RowState`, Excel-style filters, the validator, the `ChangeSet` payload, and `Repository` (load rows and lookups, apply a changeset). **Start here** -- its docstring is the API |
 | `grid.py` | the colours, `StagedTableModel` (staging + stored rows, sorting, filtering, deletion marks), the three undo commands, the per-type cell editors, the filter header, the gutter, and `GridView` (clipboard, fill, shortcuts, context menu) |
-| `sqlview.py` | `SqlView` (the same sort, filters and search as one SQL statement, plus `rank`) and `MergedView` (a window of it with this session's edits merged on top). No Qt |
+| `sqlview.py` | `SqlView` (the sort, filters and search as one SQL statement, plus `rank`) and `MergedView` (a window of it with this session's edits merged on top). No Qt |
 | `app.py` | `FilterDialog`, `MainWindow`, the sink, the theme, and `main()` |
 
 `schema.py`, `data.py` and `sqlview.py` import no Qt, which is what lets the
@@ -260,151 +257,32 @@ them, so a selected row still shows its state.
 | `F1` | the shortcut list; *Help > Colour legend* explains the colours |
 | click / right-click an id | select the row / delete, revert or restore it |
 
-## Loading
+## Loading: a window, not the table
 
-The grid does not page. It fetches the first chunk, paints the window, and
-then keeps pulling the rest in the background until the whole version is in
-memory -- one chunk per turn of the event loop, so you can scroll, type and
-search while it arrives. *Data > Load in chunks of* offers 500 / 1,000 /
-2,500 / 5,000 / 10,000 rows, or everything in one query.
-
-**This is the difference that matters: once loading finishes, sorting,
-filtering and searching cover every row.** With real pagination they only ever
-cover the page you are on, which is quietly wrong rather than merely
-incomplete -- sort a page descending and the top row looks like the maximum
-when it is only the page's maximum. While chunks are still arriving the status
-bar says `(still loading - covers the rows fetched so far)`, and stops saying
-it when the last chunk lands.
-
-Measured on Python 3.10 / PySide6 6.4.1 against a 10,000-row version:
-
-| chunk | window appears | everything loaded |
-| --- | --- | --- |
-| 500 | 341 ms | 2,248 ms |
-| 1,000 | 358 ms | 1,241 ms |
-| **2,500 (default)** | **461 ms** | **676 ms** |
-| everything at once | 652 ms | 652 ms |
-
-Each chunk costs a fixed round trip of roughly 60 ms whatever its size, so
-small chunks buy about a hundred milliseconds of first paint and pay for it
-several times over in total time and in the number of brief pauses. 2,500 is
-the balance: the window is up in under half a second and the table is complete
-in under a second, in four queries rather than twenty.
-
-Change the default with `DEFAULT_CHUNK_SIZE` at the top of `app.py`, or
-per-run with `--limit`.
-
-Memory ends up where loading everything would -- about 53 MB of rows at
-10,000, on top of a fixed ~93 MB per instance. Chunking buys responsiveness,
-not footprint. Capping footprint means doing the sorting, filtering and
-searching in SQL instead, which is what the next section is about.
-
-## Doing the work in SQL instead
-
-`sqlview.py` is the other half of that trade. It turns the same `FilterSet`,
-sort order and search text into one statement, so only the rows on screen ever
-come back. This is what **read-only mode** (`--read-only`) runs on, and what
-lets the grid open a table far larger than it could hold.
-
-The translation has to *mean* the same thing as the Python version or the two
-modes would disagree about what a filter is, so it follows the same rules the
-grid does: a foreign key sorts and filters by its **label**, which means
-joining the dimension; an enum sorts in **declaration order**, which means a
-CASE; blanks sort **last** whichever way the column is sorted; and ties break
-on the primary key, because Python's sort is stable and the rows arrive by id.
-Getting those four right took the count of disagreeing views from 7 of 18 to
-**0 of 18** -- the test
-`test_the_database_view_agrees_with_the_in_memory_one` holds it there, row for
-row and position for position, over thirteen views.
-
-### What it costs and what it buys
-
-Measured on Python 3.10 / PySide6 6.4.1, 10,000 rows in one version, with the
-SQL side fetching a 200-row window plus its total -- what it takes to paint a
-screen:
-
-| | in memory | in SQL | |
-| --- | --- | --- | --- |
-| first paint | 289 ms | **7 ms** | 40x |
-| rows held | 10,000 | **200** | |
-| memory for rows | 33 MB | **~0 MB** | |
-| sort by a foreign key label | 43.6 ms | **22.9 ms** | 2x |
-| sort by a float, descending | 36.8 ms | **16.3 ms** | 2x |
-| sort by three columns | 141.1 ms | **26.2 ms** | 5x |
-| filter: value checklist | 23.7 ms | **12.1 ms** | 2x |
-| filter: numeric condition | 24.4 ms | **11.3 ms** | 2x |
-| quick search | **8.8 ms** | 164.5 ms | 19x |
-| filtered + searched + sorted | **18.7 ms** | 50.8 ms | 3x |
-
-SQL wins everything except search, and wins it by more the more work the view
-asks for: a three-column sort is 5x faster there because Postgres sorts 10,000
-rows in C while Python builds 10,000 key tuples.
-
-Search is the exception, and badly. The quick-search box has to look in every
-column, which in SQL is twenty `ILIKE` casts with no index behind them:
-
-| searched | cost |
-| --- | --- |
-| all 20 columns | 80.1 ms |
-| the 5 string columns | 21.8 ms |
-| one column | 6.0 ms |
-| the bare count | 1.2 ms |
-
-In memory the same search is 8.8 ms because `Row.search_text` caches each
-row's folded text, so a keystroke is 10,000 substring checks over strings that
-already exist. The cost in SQL is linear in columns scanned, so if search ever
-needs to be fast there, the fix is a `tsvector` column or scanning fewer
-columns -- not a better query.
-
-### So which mode gets used
-
-| | editing | merged | read-only |
-| --- | --- | --- | --- |
-| `python app.py` | (default) | `--merged` | `--read-only` |
-| works on | model E | model E | any model |
-| holds, at 10,000 rows | all 10,000 | 500 | a capped window |
-| footprint there | 48 MB | **8 MB** | ~24 MB |
-| sort / filter / search | Python, every row | SQL + held rows | SQL, every row |
-| staging, validation, undo, commit | yes | yes | no |
-| quick search | 20 ms | 194 ms | 165 ms |
-
-Pick by what you do most. Sorting and filtering are faster with the database
-doing them and cost a fraction of the memory; quick search is an order of
-magnitude slower there, because it scans twenty unindexed columns while the
-in-memory side has a per-row text cache. Below a few thousand rows holding
-everything is simplest and nothing is slow enough to notice; past that, merged
-mode is what keeps the footprint flat, which is what matters when several
-people share one machine.
-
-If a filter has no SQL equivalent -- `matches regex` is the only one -- the
-grid falls back to filtering the rows it holds and says so in the status bar,
-naming the operator and the row count it actually covered. A partial answer
-labelled as partial is fine; a partial answer that looks whole is not.
-
-## Merged mode: the database computes the view, you still edit it
-
-```bash
-python app.py --merged          # or Data > Let the database do the work
-```
-
-Editing mode normally holds every row of the version. Merged mode holds a
-window of 500 and asks the database for the rest, while everything the grid
-does to a row -- type in it, delete it, undo it, commit it -- keeps working.
+The grid holds **1,000 rows** at a time. The database does the ordering,
+filtering and searching over the whole table, and the rows this session has
+edited are merged back on top of its answer. Scrolling fetches the window the
+viewport is looking at.
 
 Measured on Python 3.10 / PySide6 6.4.1 against 10,000 rows in one version:
 
-| | holding every row | merged |
-| --- | --- | --- |
-| window opens | 645 ms | **416 ms** |
-| rows held | 10,000 | **500** |
-| memory | 48 MB | **8 MB** |
-| sort a column | 40.8 ms | **27.1 ms** |
-| quick search | **19.5 ms** | 194.0 ms |
-| jump to the far end | n/a | 31 ms |
+| | |
+| --- | --- |
+| window opens | 538 ms, holding 1,000 of 10,000 |
+| memory for the rows | ~20 MB |
+| scroll to the bottom and back | 213 ms |
+| sort a column | 43 ms |
+| quick search | 187 ms |
+| rebuild with 21 edits pending | 78 ms (3.7 ms each) |
 
-A descending sort while holding 500 rows still puts the table's real maximum
-at the top, and a search still reports every match in the table, not every
-match in the window.
+A descending sort while holding 1,000 rows puts the table's real maximum at the
+top, and a search reports every match in the table -- 1,916 of 10,000 -- not
+every match in the window. Footprint stays flat: across 80 window moves it
+oscillated between 117 and 121 MB of process memory and ended +3.7 MB, with the
+held set sitting at exactly the five rows that had been edited.
+
+Change the default with `WINDOW_ROWS` at the top of `app.py`, or per run with
+`--window N`.
 
 ### How a row you edited stays in the right place
 
@@ -413,20 +291,22 @@ filter that row by the wrong ones. So the rows split in two:
 
 * A **held** row is one this session has touched -- edited, or marked deleted.
   It is excluded from every query by primary key and merged back in by the
-  values the grid has now.
+  values the grid has now. It is never dropped, so undo and the changeset keep
+  pointing at it.
 * Every other row is **clean**. It comes straight from the query and can be
   thrown away and refetched at will, because nothing points at it: no edit, no
   undo target, no snapshot. A clean row that comes back after a scroll is a new
   object with a new uid, and that is safe precisely because it was clean.
-  Held rows keep their identity, which is what undo and the changeset need.
 
-Placing a held row takes one number -- how many rows sort before it --
-and `SqlView.rank` asks the database for exactly that without fetching
-anything, by turning the sort order into a lexicographic comparison. Its
-position in the view is then that count plus the number of held rows ahead of
-it. One count query per held row, so the cost is bounded by how much you have
-typed rather than by how big the table is: **21 pending edits rebuild the view
-in 78 ms, about 3.7 ms each**.
+A row joins the held set the moment it is edited and leaves it when it is
+reverted, so it holds exactly the rows the database disagrees with.
+
+Placing a held row takes one number -- how many rows sort before it -- and
+`SqlView.rank` asks the database for exactly that without fetching anything, by
+turning the sort order into a lexicographic comparison. Its position in the
+view is then that count plus the number of held rows ahead of it. One count
+query per held row, so the cost is bounded by how much you have typed rather
+than by how big the table is.
 
 Two tests hold this down. `rank` is checked against the truth for *every row*
 of nine different views -- a row's rank must equal its own index -- and
@@ -434,6 +314,29 @@ of nine different views -- a row's rank must equal its own index -- and
 front, to the back and out of the sort, then walks the merged view a window at
 a time and compares it, primary key by primary key, against the same view with
 every row in memory. Window sizes down to one row included.
+
+### Translating the view
+
+`sqlview.py` turns the same `FilterSet`, sort order and search text into one
+statement. It has to *mean* what the Python version means, or the merged rows
+and the queried rows would disagree about the same view, so it follows the same
+four rules -- each of which is there because a test caught it missing:
+
+* a foreign key sorts and filters by its **label**, which means joining the
+  dimension;
+* an enum sorts in **declaration order**, which means a CASE;
+* blanks sort **last** whichever way the column is sorted;
+* ties break on the **primary key**, because Python's sort is stable.
+
+Text is compared case-insensitively on both sides (Python casefolds, so SQL
+lowers). Getting those right took the count of disagreeing views from 7 of 18
+to **0 of 18**, where `test_the_database_view_agrees_with_the_in_memory_one`
+holds it.
+
+`matches regex` is the one filter with no SQL equivalent. The database defines
+the view, so a filter it cannot express cannot be part of one: the grid drops
+that filter and says so, rather than leaving it showing in the header with no
+effect.
 
 ### What still covers the whole table
 
@@ -445,9 +348,9 @@ every row in memory. Window sizes down to one row included.
 | delete, revert, copy over a selection | fetched, one query per run of adjacent rows |
 | the changeset, undo, commit | the held set, which the window never drops |
 
-Validation is the reason editing mode held every row in the first place -- it
-has to know whether a typed key already exists anywhere in the version. It
-turns out not to need the rows, only the five unique-constraint columns:
+Validation is the reason a grid like this would normally hold every row: it has
+to know whether a typed key already exists anywhere in the version. It turns
+out not to need the rows, only the five unique-constraint columns:
 
 | held, at 10,000 rows | |
 | --- | --- |
@@ -456,52 +359,20 @@ turns out not to need the rows, only the five unique-constraint columns:
 | the keys as display text | **0.6 MB**, 59 ms |
 
 Keys are **3%** of what rows cost; at 100,000 rows that is 10 MB against
-351 MB. `Repository.natural_keys()` already did this, which is why nothing had
-to change for a windowed grid to keep catching a duplicate of a row it is not
-showing.
+351 MB. `Repository.natural_keys()` reads them straight from the database, so
+typing a duplicate of a row the grid is not showing is still caught.
 
-### What merged mode does differently
+### Two things to know
 
-* **Quick search is slower, not faster** -- 194 ms against 20 ms -- because it
-  scans twenty unindexed columns in SQL while the in-memory side has a per-row
-  text cache. If search is what you do most, hold the rows.
+* **Quick search is the slow one** -- 187 ms against about 20 ms in memory --
+  because it scans twenty unindexed columns as `ILIKE` casts. The cost is
+  linear in columns scanned (20 columns 80 ms, the 5 string columns 22 ms, one
+  column 6 ms), so if it ever needs to be fast the answer is a `tsvector`, not
+  a better query.
 * **The status bar's selection total covers the rows on screen.** It is
-  recomputed on every selection change, and a query per mouse drag is not
-  worth a sum in the status bar. Copy, delete and revert do fetch.
-* **Search means per-column**, in both modes. SQL's search is a LIKE per
-  column, so the in-memory matcher joins its cached text with a separator a
-  needle cannot contain -- otherwise a needle spanning two cells would match in
-  one mode and not the other. `%` and `_` typed in the search box are literal.
-
-Switching modes is a menu item rather than a restart, because which one suits
-depends on what the table turns out to be like, and opening it is how you find
-out.
-
-## Read-only mode, on any model
-
-```bash
-python app.py --read-only --model yourrepo.models:Invoice
-```
-
-The grid's machinery -- sorting, the filter header, the filter dialog, quick
-search, copy, fill, the gutter, the theme -- works on any SQLAlchemy
-declarative model, because all of it is driven by `TableSpec` introspection
-rather than by anything specific to model E. Point it at a model with no
-unique constraint, no foreign keys and no enum and it opens anyway: there is
-simply nothing to stage against, so the staging row, the commit button, the
-add-row action and the editing chrome are not there.
-
-Verified against three unrelated tables, none of which has a natural key:
-
-```
-ModelA   table=model_a   rows=16   cols=['Name']
-ModelD   table=model_d   rows=5    cols=['Version']
-Updates  table=updates   rows=1    cols=['Name', 'D version', 'Changes', 'Modified At']
-```
-
-What model E keeps to itself is the editing side: staging, the dropdowns on
-the key columns, validation, the deletion marks, undo, and commit to
-`Updates`.
+  recomputed on every selection change, and a query per mouse drag is not worth
+  a sum in the status bar. Copy, delete and revert do fetch what they were
+  asked for.
 
 ## Getting at the changes
 
@@ -606,30 +477,36 @@ Qt reads `#RRGGBBAA` as `#AARRGGBB`.
   one bulk operation, and there the cost is producing the display text, which
   pandas cannot help with -- its `to_csv` is slower than the `csv` module on
   the same strings.
-* Rows are loaded eagerly into memory. Measured on Python 3.10 / PySide6
-  6.4.1 with **10,000 rows in one version** -- roughly 42 MB, and:
+* The grid holds a window and the database computes the view. Measured on
+  Python 3.10 / PySide6 6.4.1 with **10,000 rows in one version**, holding
+  1,000 of them:
 
   | | |
   | --- | --- |
+  | window startup | 538 ms |
+  | memory for the rows | ~20 MB, and flat as you scroll |
   | keystroke in the staging row | 12 ms |
-  | validate every row | 8 ms |
-  | quick search | 16 ms (the first one builds a cache: ~280 ms) |
-  | apply a filter / sort a column | 41 / 37 ms |
+  | sort a column | 43 ms |
+  | quick search | 187 ms |
+  | scroll to the bottom and back | 213 ms |
   | repaint the viewport | 86 ms, and independent of row count |
-  | select all + copy the table | 363 ms |
-  | window startup | 464 ms |
 
-  Everything in the typing path stays far under what anyone notices; the
-  slower entries are one-off or bulk actions. The quick search keeps a folded
-  copy of each row's searchable text (`Row.search_text`), built on demand and
-  dropped whenever a value changes -- without it, each search re-rendered
-  every cell of every row and took 253 ms at this size.
-* There are three modes, and the difference is only ever where the view is
-  computed and how much is held: editing in memory (everything), merged (a
-  window, still editable), read-only (a window, any model). The invariant that
-  makes the windowed ones safe is that a row the session has touched is held
-  and keeps its identity, while a clean row is owned by the database and may
-  be refetched freely -- see *Merged mode* above.
+  Everything in the typing path stays far under what anyone notices. Search is
+  the one slow entry and the reason is in *Loading* above.
+* The model can still sort and filter in Python, over whatever rows it has been
+  given, and that path is what the SQL translation is tested against -- it is
+  the specification, not dead code. The app never uses it: `set_window_source`
+  hands those jobs to the database. It is also what lets the model be tested
+  without a database at all.
+* Quick search keeps a folded copy of each row's searchable text
+  (`Row.search_text`), rebuilt on demand and dropped whenever a value changes.
+  The columns are joined with a separator a needle cannot contain, so a match
+  cannot straddle two cells -- which is what keeps it the same question SQL
+  answers, where the search is a LIKE per column.
+* The invariant the windowing rests on: a row the session has touched is
+  held and keeps its identity, while a clean row is owned by the database and
+  may be refetched freely. Everything else follows from that -- see *Loading*
+  above.
 * A held row costs one count query per view rebuild, which is why the held set
   is pruned the moment a row is reverted: `_note_held` drops anything the
   database agrees with again.
