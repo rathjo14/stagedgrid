@@ -626,7 +626,12 @@ def _kind_for(col: Column) -> ColumnKind:
         return ColumnKind.PK
     if col.foreign_keys:
         return ColumnKind.FK
-    if isinstance(col.type, SAEnum) and col.type.enum_class is not None:
+    if isinstance(col.type, SAEnum) and (
+        col.type.enum_class is not None or getattr(col.type, "enums", None)
+    ):
+        # Reflected from the database there is no Python class, only the
+        # labels -- which is everything the grid needs: a fixed list to offer,
+        # in the order the type declares them.
         return ColumnKind.ENUM
     if "JSON" in type(col.type).__name__.upper():
         return ColumnKind.JSON
@@ -883,6 +888,17 @@ def sort_key(col: ColumnSpec, value: Any, lookups: Optional["Lookups"] = None) -
     if col.kind is ColumnKind.JSON:
         return display(col, value, lookups)
     return display(col, value, lookups).casefold()
+
+
+def enum_value(col: ColumnSpec, name: str) -> Any:
+    """The value the database wants for an enum member named ``name``.
+
+    With a Python class that is the member; reflected, the label is the value,
+    because that is what the column stores.
+    """
+    if col.enum_class is None:
+        return name
+    return col.enum_class[name]
 
 
 def to_db(col: ColumnSpec, value: Any) -> Any:

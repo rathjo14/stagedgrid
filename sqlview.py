@@ -38,6 +38,7 @@ from data import (
 from schema import (
     ColumnKind,
     column_of,
+    enum_value,
     ColumnSpec,
     Lookups,
     TableSpec,
@@ -133,11 +134,11 @@ class SqlView:
         this the two modes disagree the moment a label is not all one case),
         and a foreign key orders by its joined label.
         """
-        if col.kind is ColumnKind.ENUM and col.enum_class is not None:
+        if col.kind is ColumnKind.ENUM and col.enum_names:
             raw = column_of(self.model, col.key)
             return case(
                 *[
-                    (raw == col.enum_class[name], position)
+                    (raw == enum_value(col, name), position)
                     for position, name in enumerate(col.enum_names)
                 ],
                 else_=len(col.enum_names),
@@ -172,7 +173,7 @@ class SqlView:
         """
         if is_blank(value):
             return True, None
-        if col.kind is ColumnKind.ENUM and col.enum_class is not None:
+        if col.kind is ColumnKind.ENUM and col.enum_names:
             name = _enum_name(value)
             names = col.enum_names
             return False, names.index(name) if name in names else len(names)
@@ -250,8 +251,8 @@ class SqlView:
                 continue
             if col.fk is not None:
                 values.append(text)       # compared against the joined label
-            elif col.kind is ColumnKind.ENUM and col.enum_class is not None:
-                values.append(col.enum_class[text])
+            elif col.kind is ColumnKind.ENUM and text in col.enum_names:
+                values.append(enum_value(col, text))
             else:
                 try:
                     values.append(parse(col, text, self.lookups))

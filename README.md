@@ -19,7 +19,7 @@ source .venv/Scripts/activate     # or .venv\Scripts\activate.bat on cmd
 python app.py                     # the grid
 python schema.py --reset --rows 400   # (re)seed the demo data
 python schema.py --reset --rows 10000 --one-version   # a realistic single version
-python -m pytest                  # 180 tests, no server needed (sqlite)
+python -m pytest                  # 185 tests, no server needed (sqlite)
 ```
 
 There is no package and nothing to install: five modules in one folder that
@@ -119,12 +119,18 @@ already there, and it points you at `ReadOnlyTable`.
 To add a third kind, subclass `DatabaseTable` and point `window_class` at your
 window, or override `window()` when it needs more than the table to build.
 
-One caveat worth knowing: an enum reflects only as well as the database
-records it. Postgres has a real enum type, so its members come back and the
-key column keeps its drop-down; SQLite does not, so the same column arrives as
-text. It still sorts, filters and searches -- there is simply no fixed list of
-members to offer. Hand over `model=YourClass` instead of a table name and the
-class's own members are used.
+One thing worth knowing: an enum reflects only as well as the database
+records it, and that is a property of the database rather than of this code.
+Postgres has a real enum type, so reflecting gives back its members **in
+declaration order** -- the drop-down offers them and the column sorts
+`SMALL, MEDIUM, LARGE, HUGE` rather than alphabetically, the same as it would
+from a Python class. SQLite has no enum type, so the same column arrives as
+text: still sortable, filterable and searchable, but alphabetically and with
+no fixed list to offer. Hand over `model=` instead of a table name and the
+members come from whatever you hand over.
+
+A column does not need a Python class to be an enum here; the labels are the
+whole requirement.
 
 Pass `model=` anywhere you would pass a name, and everything downstream
 behaves identically -- the spec, the repository and both windows take a

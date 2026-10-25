@@ -232,3 +232,129 @@ def test_browsing_shows_the_version_as_an_ordinary_column(qapp, engine):
 
     edit = StagedTable(engine=engine, table="model_e").window()
     assert "d_id" not in [c.key for c in edit.model.columns]
+
+
+# ------------------------------------------------- an enum with no Python class
+def _classless_enum_table(engine):
+    """A table whose enum is only a database type, as reflection gives it.
+
+    Built here rather than reflected so it works on any backend: what matters
+    is a column whose SAEnum has labels and no ``enum_class``, which is what
+    comes back from a database that has a real enum type.
+    """
+    from sqlalchemy import Column, Enum as SAEnum, Integer, MetaData, String, Table
+
+    metadata = MetaData()
+    table = Table(
+        "sized",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("name", String(20)),
+        # declared smallest to largest, which is not alphabetical
+        Column("size", SAEnum("SMALL", "MEDIUM", "LARGE", "HUGE", name="size_t")),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            table.insert(),
+            [
+                {"name": f"row {n}", "size": size}
+                for n, size in enumerate(
+                    ["HUGE", "SMALL", "LARGE", "MEDIUM", "SMALL", "HUGE"]
+                )
+            ],
+        )
+    return table
+
+
+def test_an_enum_with_no_python_class_is_still_an_enum(engine):
+    """Reflected, there is no class -- only the labels, which is enough."""
+    from schema import ColumnKind, TableSpec
+
+    table = _classless_enum_table(engine)
+    spec = TableSpec.of(table)
+    size = spec["size"]
+
+    assert size.enum_class is None
+    assert size.kind is ColumnKind.ENUM        # not merely text
+    assert size.enum_names == ("SMALL", "MEDIUM", "LARGE", "HUGE")
+    assert size.kind.filterable
+
+
+def test_a_classless_enum_sorts_by_declaration_not_alphabet(engine):
+    """The whole reason an enum is not text: SMALL < MEDIUM < LARGE < HUGE."""
+    from schema import TableSpec
+    from sqlview import SqlView, ViewQuery
+
+    table = _classless_enum_table(engine)
+    spec = TableSpec.of(table)
+    view = SqlView(table, spec, None)
+
+    ordered = [
+        r.values["size"]
+        for r in view.rows(engine, ViewQuery(sort=(("size", False),)))
+    ]
+    declared = list(spec["size"].enum_names)
+    assert ordered == ["SMALL", "SMALL", "MEDIUM", "LARGE", "HUGE", "HUGE"]
+    assert [v for n, v in enumerate(ordered) if n == 0 or ordered[n - 1] != v] == declared
+    assert ordered != sorted(ordered), "that is alphabetical, not declared order"
+
+
+def test_a_classless_enum_filters_by_its_labels(engine):
+    from data import ColumnFilter, FilterSet
+    from schema import TableSpec
+    from sqlview import SqlView, ViewQuery
+
+    table = _classless_enum_table(engine)
+    spec = TableSpec.of(table)
+    view = SqlView(table, spec, None)
+
+    filters = FilterSet()
+    filters.set(ColumnFilter(key="size", allowed=frozenset({"SMALL", "HUGE"})))
+    rows = view.rows(engine, ViewQuery(filters=filters))
+    assert sorted(r.values["size"] for r in rows) == [
+        "HUGE", "HUGE", "SMALL", "SMALL"
+    ]
+
+
+def test_a_classless_enum_opens_read_only(qapp, engine):
+    """Handed the table, the window treats the enum as one."""
+    table = _classless_enum_table(engine)
+    window = ReadOnlyTable(engine=engine, model=table).window()
+
+    assert window.total_rows == 6
+    assert "Size" in [c.header for c in window.model.columns]
+    window.model.set_sort([("size", False)])
+    assert window.model.row_at(0).values["size"] == "SMALL"
+    # the filter checklist offers the members
+    column = window.model.column_index("size")
+    assert set(dict(window.model.distinct_values(column))) == {
+        "SMALL", "MEDIUM", "LARGE", "HUGE"
+    }
+
+
+def test_what_sqlite_loses_when_the_enum_is_reflected(qapp, engine):
+    """An enum reflects only as well as the database records it.
+
+    Postgres has a real enum type, so reflecting gives back the members and
+    the column keeps its order and its drop-down. SQLite does not, so the same
+    column arrives as text: still sortable, filterable and searchable, but
+    alphabetically and with no fixed list of members. Verified against
+    Postgres separately; stated here so the difference is not a surprise.
+    """
+    from schema import ColumnKind
+
+    _classless_enum_table(engine)
+    reflected = ReadOnlyTable(engine=engine, table="sized")
+    size = reflected.spec["size"]
+
+    assert size.kind is ColumnKind.STR          # SQLite has no enum type
+    assert size.enum_names == ()
+
+    window = reflected.window()
+    window.model.set_sort([("size", False)])
+    assert window.model.row_at(0).values["size"] == "HUGE"   # alphabetical
+    # and it is still perfectly usable as text
+    assert window.total_rows == 6
+    window.model.set_quick_search("SMALL")
+    assert window.total_rows == 2
