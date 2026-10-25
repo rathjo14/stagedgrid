@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional, Sequence
 
 from sqlalchemy import String, and_, case, cast, func, not_, or_, select
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy.orm import Session
 
 from data import (
     ColumnFilter,
@@ -37,6 +37,7 @@ from data import (
 )
 from schema import (
     ColumnKind,
+    column_of,
     ColumnSpec,
     Lookups,
     TableSpec,
@@ -86,17 +87,16 @@ class _Joins:
     def label_of(self, col: ColumnSpec):
         alias = self.aliases.get(col.key)
         if alias is None:
-            alias = aliased(col.fk.target_class)
+            alias = col.fk.table.alias(f"_{col.key}")
             self.aliases[col.key] = alias
-        return getattr(alias, col.fk.label_attr)
+        return alias.c[col.fk.label_column]
 
     def apply(self, stmt):
         for key, alias in self.aliases.items():
             col = self.spec[key]
             stmt = stmt.join(
                 alias,
-                getattr(self.model, key)
-                == getattr(alias, col.fk.target_pk_attr),
+                column_of(self.model, key) == alias.c[col.fk.pk_column],
                 isouter=col.nullable,
             )
         return stmt
@@ -115,7 +115,7 @@ class SqlView:
         """What the user sees, as a SQL expression."""
         if col.fk is not None:
             return joins.label_of(col)
-        return getattr(self.model, col.key)
+        return column_of(self.model, col.key)
 
     def _is_blank(self, col: ColumnSpec, joins: _Joins):
         """What the grid counts as empty: NULL, and "" for text."""
@@ -134,7 +134,7 @@ class SqlView:
         and a foreign key orders by its joined label.
         """
         if col.kind is ColumnKind.ENUM and col.enum_class is not None:
-            raw = getattr(self.model, col.key)
+            raw = column_of(self.model, col.key)
             return case(
                 *[
                     (raw == col.enum_class[name], position)
@@ -221,7 +221,7 @@ class SqlView:
             disjuncts.append(and_(*prefix, ahead) if prefix else ahead)
             prefix.append(tied)
 
-        ahead = getattr(self.model, pk_key) < pk_value
+        ahead = column_of(self.model, pk_key) < pk_value
         disjuncts.append(and_(*prefix, ahead) if prefix else ahead)
         return or_(*disjuncts)
 
@@ -360,11 +360,11 @@ class SqlView:
         clauses = []
         version = next(
             (c for c in self.spec.key_columns
-             if c.fk is not None and c.fk.label_attr in ("version", "revision")),
+             if c.fk is not None and c.fk.label_column in ("version", "revision")),
             None,
         )
         if version is not None and query.version_id is not None:
-            clauses.append(getattr(self.model, version.key) == query.version_id)
+            clauses.append(column_of(self.model, version.key) == query.version_id)
         if query.filters:
             for key in query.filters.active_keys():
                 flt = query.filters.get(key)
@@ -375,19 +375,19 @@ class SqlView:
             if found is not None:
                 clauses.append(found)
         if query.exclude_pks:
-            pk = getattr(self.model, self.spec.pk.key)
+            pk = column_of(self.model, self.spec.pk.key)
             clauses.append(pk.notin_(tuple(query.exclude_pks)))
         return clauses
 
     def statement(self, query: ViewQuery):
         joins = _Joins(self.spec, self.model)
-        columns = [getattr(self.model, c.key) for c in self.spec.columns]
+        columns = [column_of(self.model, c.key) for c in self.spec.columns]
         where = self._where(query, joins)          # may add joins
         order = []
         for key, descending in query.sort:
             order.extend(self._order_by(self.spec[key], descending, joins))
         # The stable-sort tie-break, and the order the grid loads in anyway.
-        order.append(getattr(self.model, self.spec.pk.key).asc())
+        order.append(column_of(self.model, self.spec.pk.key).asc())
 
         stmt = select(*columns)
         stmt = joins.apply(stmt)
@@ -435,7 +435,7 @@ class SqlView:
         """
         joins = _Joins(self.spec, self.model)
         where = self._where(query, joins)
-        raw = getattr(self.model, col.key)
+        raw = column_of(self.model, col.key)
         stmt = select(raw, func.count()).select_from(self.model)
         stmt = joins.apply(stmt)
         if where:

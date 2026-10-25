@@ -8,6 +8,10 @@ changeset that is handed to another API on commit.
 
 ![a row needing attention, and Commit blocked](shots/11-attention-and-commit.png)
 
+Read-only, over a table found by name (`tables/`):
+
+![browsing a table](shots/12-read-only.png)
+
 ## Run it
 
 ```bash
@@ -15,7 +19,7 @@ source .venv/Scripts/activate     # or .venv\Scripts\activate.bat on cmd
 python app.py                     # the grid
 python schema.py --reset --rows 400   # (re)seed the demo data
 python schema.py --reset --rows 10000 --one-version   # a realistic single version
-python -m pytest                  # 166 tests, no server needed (sqlite)
+python -m pytest                  # 180 tests, no server needed (sqlite)
 ```
 
 There is no package and nothing to install: five modules in one folder that
@@ -40,7 +44,7 @@ override with `STAGEDGRID_DSN` or `--dsn`. `--window N` sets how many rows are
 held at once (1,000 by default) and `--changesets DIR` says where committed
 payloads are written.
 
-## The five files
+## The five files, and a package
 
 ```
 schema.py    the models, and everything that reads them
@@ -48,6 +52,8 @@ data.py      what is pending, and talking to the database   <- your entry point
 sqlview.py   the same view, in SQL, and the window merged onto it
 grid.py      the table widget
 app.py       the window around it                           <- run this one
+
+tables/      a table found by name, and what you may do with it
 ```
 
 Imports only ever go one way: `schema <- data <- {sqlview, grid} <- app`.
@@ -62,6 +68,67 @@ Imports only ever go one way: `schema <- data <- {sqlview, grid} <- app`.
 
 `schema.py`, `data.py` and `sqlview.py` import no Qt, which is what lets the
 tests cover the logic without a screen.
+
+## tables/: open a table by name
+
+The flat modules above are driven by a mapped class. `tables/` is the same
+machinery reached by a different road -- a DSN, a schema and a table name --
+with a class per thing you might want to do with what it finds:
+
+```
+DatabaseTable      a dsn, a schema, a table name, reflected
+  ReadOnlyTable    browse it: sort, filter, search, copy
+  StagedTable      edit it: staging, validation, undo, commit
+```
+
+```python
+from PySide6.QtWidgets import QApplication
+from app import apply_theme
+from tables import ReadOnlyTable, StagedTable
+
+app = QApplication([])
+apply_theme(app)
+
+ReadOnlyTable(dsn, "fact_table", schema="analytics").open()
+StagedTable(dsn, "model_e", updates="updates").open()
+
+app.exec()
+```
+
+`DatabaseTable` reflects the table, which pulls in whatever its foreign keys
+point at -- so a key column shows its label rather than an id without being
+told anything. The natural key, the version column and the headers are all
+read the same way. `describe()` prints what it worked out, as `--describe`
+does for the flat app.
+
+Both windows are the same grid: the same header, filter dialog, quick search,
+clipboard, row numbers and lazy window. The read-only one is not a second
+implementation -- it is that grid with `editable=False`, which leaves it with
+no staging block and no editable cell. What differs:
+
+| | browsing | editing |
+| --- | --- | --- |
+| needs | the table to exist | a unique constraint as well |
+| the version column | shown, as ordinary data | hidden; one per view, inherited by new rows |
+| staging, validation, undo, commit | no | yes |
+
+`StagedTable` says so rather than misbehaving if the table has no unique
+constraint: without one there is no way to tell a typed row from one that is
+already there, and it points you at `ReadOnlyTable`.
+
+To add a third kind, subclass `DatabaseTable` and point `window_class` at your
+window, or override `window()` when it needs more than the table to build.
+
+One caveat worth knowing: an enum reflects only as well as the database
+records it. Postgres has a real enum type, so its members come back and the
+key column keeps its drop-down; SQLite does not, so the same column arrives as
+text. It still sorts, filters and searches -- there is simply no fixed list of
+members to offer. Hand over `model=YourClass` instead of a table name and the
+class's own members are used.
+
+Pass `model=` anywhere you would pass a name, and everything downstream
+behaves identically -- the spec, the repository and both windows take a
+reflected table and a mapped class the same way.
 
 ## Pointing it at your real models
 

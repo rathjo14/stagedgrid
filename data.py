@@ -36,7 +36,8 @@ from dataclasses import dataclass, field
 from functools import cmp_to_key
 from typing import Any, Callable, Iterable, Optional, Sequence
 
-from sqlalchemy import delete, func, null, select, update
+from sqlalchemy import delete, func, insert, null, select, update
+from sqlalchemy import Table
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -54,6 +55,7 @@ from schema import (
     Unresolved,
     display,
     is_blank,
+    column_of,
     make_engine,
     sort_key,
     to_db,
@@ -981,7 +983,7 @@ class Repository:
             # The demo mapping belongs to the demo models only: with your own
             # models, let the introspection work the label columns out.
             label_columns = LABEL_COLUMNS if model is ModelE else {}
-        self.spec = TableSpec.from_mapped_class(model, label_columns)
+        self.spec = TableSpec.of(model, label_columns)
         version = self.version_column
         self.updates: Optional[UpdatesSpec] = (
             UpdatesSpec.from_mapped_class(
@@ -997,11 +999,8 @@ class Repository:
         col = self.version_column
         if col is None or version_id is None:
             return ""
-        target = col.fk.target_class
         found = session.execute(
-            select(getattr(target, col.fk.label_attr)).where(
-                getattr(target, col.fk.target_pk_attr) == version_id
-            )
+            select(col.fk.label()).where(col.fk.pk() == version_id)
         ).scalar()
         return str(found or "")
 
@@ -1088,12 +1087,8 @@ class Repository:
         lookups = Lookups()
         with Session(self.engine) as s:
             for col in self.spec.fk_columns:
-                target = col.fk.target_class
                 pairs = s.execute(
-                    select(
-                        getattr(target, col.fk.target_pk_attr),
-                        getattr(target, col.fk.label_attr),
-                    )
+                    select(col.fk.pk(), col.fk.label())
                 ).all()
                 lookups.register(col, pairs)
         return lookups
@@ -1107,14 +1102,8 @@ class Repository:
         col = self.version_column
         if col is None:
             return None
-        target = col.fk.target_class
         with Session(self.engine) as s:
-            pairs = s.execute(
-                select(
-                    getattr(target, col.fk.target_pk_attr),
-                    getattr(target, col.fk.label_attr),
-                )
-            ).all()
+            pairs = s.execute(select(col.fk.pk(), col.fk.label())).all()
         if not pairs:
             return None
         pk, label = max(pairs, key=lambda pair: natural_sort_key(str(pair[1])))
@@ -1135,8 +1124,8 @@ class Repository:
         """
         keys = [c.key for c in self.spec.columns]
         enum_keys = {c.key for c in self.spec.columns if c.kind is ColumnKind.ENUM}
-        stmt = select(*(getattr(self.model, k) for k in keys)).order_by(
-            getattr(self.model, self.spec.pk.key)
+        stmt = select(*(column_of(self.model, k) for k in keys)).order_by(
+            column_of(self.model, self.spec.pk.key)
         )
         version = self.version_column
         if version is not None:
@@ -1144,7 +1133,7 @@ class Repository:
                 newest = self.latest_version()
                 version_id = newest[0] if newest else None
             if version_id is not None:
-                stmt = stmt.where(getattr(self.model, version.key) == version_id)
+                stmt = stmt.where(column_of(self.model, version.key) == version_id)
         if limit:
             stmt = stmt.limit(limit)
 
@@ -1173,13 +1162,14 @@ class Repository:
         """
         if col.fk is None:
             raise ValueError(f"{col.header} is not a foreign key")
-        target = col.fk.target_class
         try:
             with Session(self.engine) as s, s.begin():
-                row = target(**{col.fk.label_attr: label})
-                s.add(row)
-                s.flush()
-                return getattr(row, col.fk.target_pk_attr)
+                made = s.execute(
+                    insert(col.fk.table)
+                    .values(**{col.fk.label_column: label})
+                    .returning(col.fk.pk())
+                )
+                return int(made.scalar_one())
         except SQLAlchemyError as exc:
             raise ValueError(_clean_error(exc)) from exc
 
@@ -1194,7 +1184,7 @@ class Repository:
                 newest = self.latest_version()
                 version_id = newest[0] if newest else None
             if version_id is not None:
-                stmt = stmt.where(getattr(self.model, version.key) == version_id)
+                stmt = stmt.where(column_of(self.model, version.key) == version_id)
         with Session(self.engine) as s:
             return int(s.execute(stmt).scalar_one())
 
@@ -1212,8 +1202,8 @@ class Repository:
         """
         if not self.spec.key_columns:
             return {}
-        key_cols = [getattr(self.model, c.key) for c in self.spec.key_columns]
-        pk_attr = getattr(self.model, self.spec.pk.key)
+        key_cols = [column_of(self.model, c.key) for c in self.spec.key_columns]
+        pk_attr = column_of(self.model, self.spec.pk.key)
         stmt = select(pk_attr, *key_cols)
         version = self.version_column
         if version is not None:
@@ -1221,7 +1211,7 @@ class Repository:
                 newest = self.latest_version()
                 version_id = newest[0] if newest else None
             if version_id is not None:
-                stmt = stmt.where(getattr(self.model, version.key) == version_id)
+                stmt = stmt.where(column_of(self.model, version.key) == version_id)
         out: dict[tuple, int] = {}
         with Session(self.engine) as s:
             for pk, *key in s.execute(stmt):
@@ -1240,8 +1230,8 @@ class Repository:
             return []
         keys = [c.key for c in self.spec.columns]
         enum_keys = {c.key for c in self.spec.columns if c.kind is ColumnKind.ENUM}
-        pk_attr = getattr(self.model, self.spec.pk.key)
-        stmt = select(*(getattr(self.model, k) for k in keys)).where(
+        pk_attr = column_of(self.model, self.spec.pk.key)
+        stmt = select(*(column_of(self.model, k) for k in keys)).where(
             pk_attr.in_(tuple(wanted))
         )
         rows: list[Row] = []
@@ -1254,6 +1244,24 @@ class Repository:
                 rows.append(Row.from_db(values))
         return rows
 
+    def _insert(self, session, payload: dict) -> int:
+        """Add one row and return its new primary key.
+
+        A mapped class is constructed and added, which is what gives the
+        defaults and any __init__ a say. A reflected table has no class to
+        construct, so the same row goes in through Core.
+        """
+        pk = self.spec.pk.key
+        if isinstance(self.model, Table):
+            made = session.execute(
+                insert(self.model).values(**payload).returning(column_of(self.model, pk))
+            )
+            return int(made.scalar_one())
+        obj = self.model(**payload)
+        session.add(obj)
+        session.flush()
+        return getattr(obj, pk)
+
     def apply(self, changeset: ChangeSet, dry_run: bool = False) -> ApplyResult:
         """Deletes, then updates, then inserts, so a freed key can be reused.
 
@@ -1261,7 +1269,7 @@ class Repository:
         way to find out whether the database agrees with our validation.
         """
         result = ApplyResult(dry_run=dry_run)
-        pk_attr = getattr(self.model, self.spec.pk.key)
+        pk_attr = column_of(self.model, self.spec.pk.key)
         deletes = changeset.deletes
         try:
             with Session(self.engine) as s, s.begin():
@@ -1287,10 +1295,7 @@ class Repository:
                         key: to_db(self.spec[key], value)
                         for key, value in {**op.key, **op.values}.items()
                     }
-                    obj = self.model(**payload)
-                    s.add(obj)
-                    s.flush()
-                    result.inserted.append(getattr(obj, self.spec.pk.key))
+                    result.inserted.append(self._insert(s, payload))
 
                 if dry_run:
                     s.flush()

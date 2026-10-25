@@ -190,10 +190,10 @@ def test_spec_finds_natural_key_and_labels(spec: TableSpec):
 
     a = spec["a_id"]
     assert a.kind is ColumnKind.FK
-    assert a.fk.target_table == "model_a" and a.fk.label_attr == "name"
+    assert a.fk.target_table == "model_a" and a.fk.label_column == "name"
     assert a.header == "A"
     # model_d keys on `version`, not `name`
-    assert spec["d_id"].fk.label_attr == "version"
+    assert spec["d_id"].fk.label_column == "version"
     assert spec["d_id"].header == "D version"
 
 
@@ -219,7 +219,7 @@ def test_key_columns_are_locked_on_existing_rows(spec: TableSpec):
 
 def test_label_columns_can_be_overridden():
     other = TableSpec.from_mapped_class(ModelE, {**LABEL_COLUMNS, "model_d": "id"})
-    assert other["d_id"].fk.label_attr == "id"
+    assert other["d_id"].fk.label_column == "id"
 
 
 # -------------------------------------------------------------------- values
@@ -1340,8 +1340,8 @@ def test_the_grid_drives_a_completely_different_schema(qapp, other_repo):
     assert spec.unique_constraint == "uq_reading"
     assert [c.key for c in spec.key_columns] == ["region_id", "product_id", "bucket"]
     # the dimension label columns were worked out without being told
-    assert spec["region_id"].fk.label_attr == "code"
-    assert spec["product_id"].fk.label_attr == "sku"
+    assert spec["region_id"].fk.label_column == "code"
+    assert spec["product_id"].fk.label_column == "sku"
     assert spec["region_id"].header == "Region"
     assert spec["value"].doc == "The measurement"
 

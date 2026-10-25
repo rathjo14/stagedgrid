@@ -320,14 +320,24 @@ class UpdatesSpec:
     label: Optional[str] = None     # a human name for the branch
 
     @classmethod
+    def of(cls, model, version_table: Optional[str] = None) -> "UpdatesSpec":
+        """Read whichever kind of model this is."""
+        return cls.from_mapped_class(model, version_table)
+
+    @classmethod
     def from_mapped_class(
-        cls, model: type, version_table: Optional[str] = None
+        cls, model, version_table: Optional[str] = None
     ) -> "UpdatesSpec":
-        mapper = inspect(model)
-        table = mapper.local_table
+        """Find each thing by column type, in a mapped class or a Table."""
+        table = table_of(model)
+        name_of = (
+            (lambda col: col.name)
+            if isinstance(model, Table)
+            else (lambda col, m=inspect(model): _attr_name(m, col))
+        )
         found = {"changes": None, "version": None, "modified_at": None, "label": None}
         for col in table.columns:
-            attr = _attr_name(mapper, col)
+            attr = name_of(col)
             kind = _kind_for(col)
             if kind is ColumnKind.JSON and found["changes"] is None:
                 found["changes"] = attr
@@ -341,10 +351,30 @@ class UpdatesSpec:
                 found["label"] = attr
         if found["changes"] is None:
             raise ValueError(
-                f"{model.__name__} has no json column to keep the changes in"
+                f"{model_name(model)} has no json column to keep the changes in"
             )
-        pk = _attr_name(mapper, list(table.primary_key.columns)[0])
+        pk = name_of(list(table.primary_key.columns)[0])
         return cls(model=model, pk=pk, **found)
+
+
+def table_of(model) -> Table:
+    """The Table behind a model, mapped or already a Table."""
+    return model if isinstance(model, Table) else inspect(model).local_table
+
+
+def column_of(model, key: str):
+    """One column of a model, mapped or reflected.
+
+    A mapped class answers to ``getattr``; a reflected table does not, and
+    everything that builds a query here only ever wanted the column.
+    """
+    if isinstance(model, Table):
+        return model.c[key]
+    return getattr(model, key)
+
+
+def model_name(model) -> str:
+    return model.name if isinstance(model, Table) else model.__name__
 
 
 #: Parent table -> column shown instead of the raw id.  Auto-detected when a
@@ -391,12 +421,23 @@ class ColumnKind(enum.Enum):
 
 @dataclass(frozen=True)
 class FkSpec:
-    """Where a foreign key points and which column of the parent to show."""
+    """Where a foreign key points and which column of the parent to show.
 
-    target_table: str
-    target_class: type
-    target_pk_attr: str
-    label_attr: str
+    The parent is a :class:`~sqlalchemy.Table`, not a mapped class: a table
+    reflected from the database has no class, and every query built from this
+    wanted columns rather than attributes in the first place.
+    """
+
+    target_table: str      # the name, for headers and messages
+    table: Any             # the selectable to join against
+    pk_column: str         # what the foreign key points at
+    label_column: str      # what to show instead of the id
+
+    def pk(self):
+        return self.table.c[self.pk_column]
+
+    def label(self):
+        return self.table.c[self.label_column]
 
 
 @dataclass(frozen=True)
@@ -412,6 +453,8 @@ class ColumnSpec:
     is_pk: bool = False
     fk: Optional[FkSpec] = None
     enum_class: Optional[type] = None
+    #: An enum reflected from the database has labels but no Python class.
+    enum_labels: tuple = ()
     max_length: Optional[int] = None
     width: int = 110
 
@@ -424,7 +467,7 @@ class ColumnSpec:
         SQLAlchemy's Enum type stores by default.
         """
         if self.enum_class is None:
-            return ()
+            return tuple(self.enum_labels)
         return tuple(m.name for m in self.enum_class)
 
     @property
@@ -479,7 +522,7 @@ class TableSpec:
         every cell says the same thing.
         """
         for col in self.key_columns:
-            if col.fk is not None and col.fk.label_attr in ("version", "revision"):
+            if col.fk is not None and col.fk.label_column in ("version", "revision"):
                 return col
         return None
 
@@ -492,20 +535,47 @@ class TableSpec:
         cls, model: type, label_columns: Optional[dict[str, str]] = None
     ) -> "TableSpec":
         """Read the mapper: pk first, then the natural key, then everything else."""
-        label_columns = label_columns or {}
         mapper = inspect(model)
-        table: Table = mapper.local_table
+        return cls._build(
+            model,
+            mapper.local_table,
+            lambda col: _attr_name(mapper, col),
+            label_columns or {},
+        )
 
+    @classmethod
+    def of(
+        cls, model, label_columns: Optional[dict[str, str]] = None
+    ) -> "TableSpec":
+        """Read whichever kind of model this is."""
+        if isinstance(model, Table):
+            return cls.from_table(model, label_columns)
+        return cls.from_mapped_class(model, label_columns)
+
+    @classmethod
+    def from_table(
+        cls, table: Table, label_columns: Optional[dict[str, str]] = None
+    ) -> "TableSpec":
+        """The same, for a table reflected from the database.
+
+        There is no class and no attribute names, so a column is known by its
+        own name. Everything else -- the natural key, the foreign keys and
+        their labels, the enums -- is read from the table itself, which is
+        where it came from for a mapped class too.
+        """
+        return cls._build(table, table, lambda col: col.name, label_columns or {})
+
+    @classmethod
+    def _build(cls, model, table: Table, name_of, label_columns) -> "TableSpec":
         natural_key = _largest_unique_constraint(table)
         key_names = [c.name for c in natural_key.columns] if natural_key else []
 
         specs = {
             col.name: _column_spec(
                 col,
-                _attr_name(mapper, col),
+                name_of(col),
                 in_key=col.name in key_names,
                 label_columns=label_columns,
-                registry=mapper.registry,
             )
             for col in table.columns
         }
@@ -514,6 +584,8 @@ class TableSpec:
         for name in key_names + [c.name for c in table.columns]:
             if name not in order:
                 order.append(name)
+        if not order:
+            raise ValueError(f"{table.name} has no primary key")
 
         return cls(
             model=model,
@@ -581,33 +653,31 @@ def _class_for_table(table: Table, registry) -> type:
     raise LookupError(f"no mapped class for table {table.name!r}")
 
 
-def _detect_label_attr(target_table: Table, target_class: type) -> str:
+def _detect_label_column(target_table: Table) -> str:
     """Pick the column of a dimension table that humans recognise."""
     single_uc = {
         list(c.columns)[0].name
         for c in target_table.constraints
         if isinstance(c, UniqueConstraint) and len(c.columns) == 1
     }
-    mapper = inspect(target_class)
     for col in target_table.columns:
         if not col.primary_key and (col.unique or col.name in single_uc):
-            return _attr_name(mapper, col)
+            return col.name
     for col in target_table.columns:  # no unique column: first text column
         if not col.primary_key and _python_type(col) is str:
-            return _attr_name(mapper, col)
-    return "id"
+            return col.name
+    return list(target_table.primary_key.columns)[0].name
 
 
-def _fk_spec(col: Column, label_columns: dict[str, str], registry) -> FkSpec:
+def _fk_spec(col: Column, label_columns: dict[str, str]) -> FkSpec:
     fk = next(iter(col.foreign_keys))
     target_table = fk.column.table
-    target_class = _class_for_table(target_table, registry)
     return FkSpec(
         target_table=target_table.name,
-        target_class=target_class,
-        target_pk_attr=_attr_name(inspect(target_class), fk.column),
-        label_attr=label_columns.get(target_table.name)
-        or _detect_label_attr(target_table, target_class),
+        table=target_table,
+        pk_column=fk.column.name,
+        label_column=label_columns.get(target_table.name)
+        or _detect_label_column(target_table),
     )
 
 
@@ -623,8 +693,8 @@ def _header_for_fk(fk: FkSpec) -> str:
             stem = stem[len(prefix) :]
             break
     label = stem.upper() if len(stem) <= 2 else stem.replace("_", " ").title()
-    if fk.label_attr not in ("name", "code", "label", "title"):
-        label = f"{label} {fk.label_attr}"
+    if fk.label_column not in ("name", "code", "label", "title"):
+        label = f"{label} {fk.label_column}"
     return label
 
 
@@ -633,10 +703,9 @@ def _column_spec(
     attr: str,
     in_key: bool,
     label_columns: dict[str, str],
-    registry,
 ) -> ColumnSpec:
     kind = _kind_for(col)
-    fk = _fk_spec(col, label_columns, registry) if kind is ColumnKind.FK else None
+    fk = _fk_spec(col, label_columns) if kind is ColumnKind.FK else None
 
     if kind is ColumnKind.PK:
         header, width = _header_for(col.name).upper(), 64
@@ -659,6 +728,7 @@ def _column_spec(
         is_pk=bool(col.primary_key),
         fk=fk,
         enum_class=getattr(col.type, "enum_class", None),
+        enum_labels=tuple(getattr(col.type, "enums", ()) or ()),
         max_length=getattr(col.type, "length", None),
         width=width,
     )
@@ -868,7 +938,7 @@ class Lookups:
 
     @staticmethod
     def _key(col: ColumnSpec) -> str:
-        return f"{col.fk.target_table}.{col.fk.label_attr}"
+        return f"{col.fk.target_table}.{col.fk.label_column}"
 
     def register(self, col: ColumnSpec, pairs: Iterable[tuple[int, str]]) -> None:
         """Cache ``col``'s dimension from (pk, label) pairs."""
@@ -953,7 +1023,7 @@ def describe(spec: "TableSpec") -> str:
     """What the grid worked out about a table -- print this when wiring up
     your own models, to check it read them the way you expect."""
     lines = [
-        f"{spec.model.__name__} -> table {spec.table_name!r}",
+        f"{model_name(spec.model)} -> table {spec.table_name!r}",
         f"  primary key      {spec.pk.key}   (shown as the row index, not a column)",
         f"  natural key      {spec.unique_constraint or '(none found!)'}",
         "",
@@ -966,7 +1036,7 @@ def describe(spec: "TableSpec") -> str:
         )
         source = ""
         if col.fk is not None:
-            source = f"{col.fk.target_table}.{col.fk.label_attr}"
+            source = f"{col.fk.target_table}.{col.fk.label_column}"
         elif col.enum_class is not None:
             source = ", ".join(col.enum_names)
         lines.append(

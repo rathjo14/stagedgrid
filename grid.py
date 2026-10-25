@@ -298,15 +298,23 @@ class StagedTableModel(QAbstractTableModel):
         lookups: Optional[Lookups] = None,
         undo_stack: Optional[QUndoStack] = None,
         parent=None,
+        editable: bool = True,
     ) -> None:
         super().__init__(parent)
         self.spec = spec
-        #: The version is one value for everything being worked on, so it is
-        #: shown once beside the data instead of as a column where every cell
-        #: says the same thing. New rows inherit it; see `set_version`.
-        self.version_col = spec.version_column
+        #: A grid that cannot be edited has no staging block either -- there is
+        #: nothing to stage -- which is what lets a table with no natural key
+        #: be opened at all.
+        self.editable = editable
+        #: While editing, the version is one value for everything being worked
+        #: on, so it is shown once beside the data instead of as a column where
+        #: every cell says the same thing, and new rows inherit it -- see
+        #: `set_version`. A grid that is only being read is looking at whatever
+        #: the query returned, across versions, so there the version is data
+        #: like any other column.
+        self.version_col = spec.version_column if editable else None
         #: The columns the grid shows: everything but the primary key, which is
-        #: the row index in the gutter, and the version.
+        #: the row index in the gutter, and the version while editing.
         hidden = {spec.pk.key} | (
             {self.version_col.key} if self.version_col is not None else set()
         )
@@ -321,7 +329,7 @@ class StagedTableModel(QAbstractTableModel):
 
         self._db_rows: list[Row] = []
         # No version yet -- `set_version` fills it in and tops this one up.
-        self._staged: list[Row] = [Row.staged(spec)]
+        self._staged: list[Row] = [Row.staged(spec)] if editable else []
         self._view: list[int] = []
         self._marks: dict[int, list[int]] = {}
         self._trailing_marks: list[int] = []
@@ -352,7 +360,7 @@ class StagedTableModel(QAbstractTableModel):
         # open a branch, say) leaves the previous session's held rows behind
         # and every one of their edits is counted twice.
         self._held.clear()
-        self._staged = [self.blank_staged()]
+        self._staged = [self.blank_staged()] if self.editable else []
         self.validator.set_existing_keys(existing_key_map(self.spec, self._db_rows))
         self._reindex()
         self._rebuild_order()
@@ -545,7 +553,7 @@ class StagedTableModel(QAbstractTableModel):
                     bits.append(col.doc)
                 kind = col.kind.value
                 if col.fk is not None:
-                    kind = f"{col.fk.target_table}.{col.fk.label_attr}"
+                    kind = f"{col.fk.target_table}.{col.fk.label_column}"
                 bits.append(
                     f"<i>{kind}{'' if col.nullable else ', required'}"
                     f"{', part of the unique key' if col.in_key else ''}</i>"
@@ -584,7 +592,7 @@ class StagedTableModel(QAbstractTableModel):
             return Qt.ItemFlag.NoItemFlags
         base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
         row = self.row_at(index.row())
-        if row is None or row.state is RowState.DELETED:
+        if row is None or row.state is RowState.DELETED or not self.editable:
             return base
         col = self.columns[index.column()]
         editable = (
@@ -873,6 +881,8 @@ class StagedTableModel(QAbstractTableModel):
 
     def _normalise_staging(self) -> None:
         """Keep exactly one trailing blank staging row."""
+        if not self.editable:
+            return
         spec = self.spec
         while (
             len(self._staged) >= 2
